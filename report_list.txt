@@ -1,5 +1,6 @@
 service/
     processor.py
+    config.py
     embeddings_writer.py
     archiver.py
     main.py
@@ -7,5 +8,6 @@ service/
     db_writer.py
     stats_collector.py
     web_server.py
+    view_web_server.py
     downloader.py
     models.py

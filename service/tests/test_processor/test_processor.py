@@ -1,4 +1,5 @@
-# file: tests/test_processor/test_processor.py
+# file: test_processor.py
+# directory: tests/test_processor
 
 import threading
 import os
@@ -11,14 +12,17 @@ from queue import Queue
 sys.path.append('../../')
 
 from processor import processing_thread
-from utils import configure_thread_logging, get_engine, setup_database
+from utils import configure_thread_logging, get_engine, get_session_factory, setup_database
 from stats_collector import StatsCollector
 from models import ImageEmbedding, Image, BatchImage
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1
 import json
-
+import config  # Импортируем модуль конфигурации
 def main():
+    # Устанавливаем переменную окружения MACHINE_ID
+    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
+
     # Директории для входных и выходных данных
     input_dir = 'input_data'
     output_dir = 'output_data'
@@ -82,8 +86,7 @@ def main():
                 break
             # Сохраняем archive_info для следующего теста
             output_file = os.path.join(output_dir, 'archive_info.json')
-            with open(output_file, 'w') as f:
-                json.dump(archive_info, f)
+            json.dump(archive_info, open(output_file, 'w'))
             archive_queue.task_done()
 
     # Запускаем заглушки

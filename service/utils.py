@@ -2,7 +2,7 @@
 # directory: .
 import os
 import logging
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import cv2
 import torch
@@ -24,6 +24,11 @@ def get_session_factory(engine):
 
 def setup_database(engine):
     Base.metadata.create_all(engine)
+    # Создаём расширение vector, если его нет
+
+    with engine.connect() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
 
 def preprocess_image(image_path):
     """

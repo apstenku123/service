@@ -1,4 +1,5 @@
-# file: tests/test_archiver/test_archiver.py
+# file: archiver.py
+# directory: tests/test_archiver
 
 import threading
 import os
@@ -6,17 +7,20 @@ import sys
 import shutil
 import time
 from queue import Queue
-
+import config  # Импортируем модуль конфигурации
 # Adjust the import paths if necessary
 sys.path.append('../../')
 
 from archiver import archiver_thread
-from utils import configure_thread_logging, get_engine, setup_database
+from utils import configure_thread_logging, get_engine, get_session_factory, setup_database
 from stats_collector import StatsCollector
 from models import ArchivedImage
 import json
 
 def main():
+    # Устанавливаем переменную окружения MACHINE_ID
+    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
+
     # Директории для входных и выходных данных
     input_dir = 'input_data'
     output_dir = 'output_data'
@@ -66,7 +70,7 @@ def main():
     }
     os.makedirs(archive_config['archive_directory'], exist_ok=True)
 
-    # Переопределяем функции архивирования для локального типа
+    # Модифицируем функции архиватора для обработки типа 'local'
     from archiver import archive_batch
     def archive_batch_local(batch_dir, batch_id, archive_type, archive_config, logger):
         archive_dir = archive_config['archive_directory']

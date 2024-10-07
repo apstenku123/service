@@ -6,11 +6,11 @@ import traceback
 from utils import configure_thread_logging, get_session_factory
 from models import ImageEmbedding, HostLog
 import socket
-
+import config  # Импортируем модуль конфигурации
 def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector, log_level, log_output):
-    global MACHINE_ID
+    # global MACHINE_ID
     # Set up logger for this function
-    log_filename = f'logs/embeddings_writer/embeddings_writer_{MACHINE_ID}.log'
+    log_filename = f'logs/embeddings_writer/embeddings_writer_{config.MACHINE_ID}.log'
     embeddings_writer_logger = configure_thread_logging('embeddings_writer', log_filename, log_level, log_output)
 
     SessionFactory = get_session_factory(engine)
@@ -63,6 +63,7 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
                         embeddings_writer_logger.error(f"InsightFace embedding length is not 512 for image_id {data['image_id']}")
                         insightface_embedding_vector = None  # Если некорректный размер, сохраняем как None
                 else:
+                    embeddings_writer_logger.error(f"InsightFace embedding length is none")
                     insightface_embedding_vector = None
 
                 embedding = ImageEmbedding(

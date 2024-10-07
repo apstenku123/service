@@ -12,11 +12,11 @@ from azure.storage.blob import BlobServiceClient
 import ftplib
 import paramiko
 import socket
-
+import config  # Импортируем модуль конфигурации
 def archiver_thread(archive_queue, engine, archive_type, archive_config, stats_collector, log_level, log_output):
-    global MACHINE_ID
+    # global MACHINE_ID
     # Set up logger for this function
-    log_filename = f'logs/archiver/archiver_{MACHINE_ID}.log'
+    log_filename = f'logs/archiver/archiver_{config.MACHINE_ID}.log'
     archiver_logger = configure_thread_logging('archiver', log_filename, log_level, log_output)
 
     SessionFactory = get_session_factory(engine)

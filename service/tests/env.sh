@@ -1,0 +1,6 @@
+export DB_HOST="photo-db.postgres.database.azure.com"
+export DB_NAME="photo_db_test"
+export DB_USER="dave"
+export DB_PASSWORD="JopaJopa??1234"
+export SERVICE_BUS_CONNECTION_STR="Endpoint=sb://photo-db.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=yktAGIsBUeppPfSZ/L2R0ikcLNRLJg6w1+ASbJg/99A="
+export QUEUE_NAME="photos"

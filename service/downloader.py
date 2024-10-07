@@ -4,8 +4,8 @@ import threading
 import time
 
 import requests
-from queue import Queue
-from urllib.parse import urlparse
+# from queue import Queue
+# from urllib.parse import urlparse
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,12 +13,13 @@ from bs4 import BeautifulSoup
 
 from utils import configure_thread_logging, get_session_factory, get_engine
 from models import ArchivedImage
-import traceback
+# import traceback
+import config  # Импортируем модуль конфигурации
 
 def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads, stats_collector, log_level, log_output, archive_enabled):
-    global MACHINE_ID
+    # global MACHINE_ID
     # Set up logger for this function
-    log_filename = f'logs/downloader/downloader_{MACHINE_ID}.log'
+    log_filename = f'logs/downloader/downloader_{config.MACHINE_ID}.log'
     downloader_logger = configure_thread_logging('downloader', log_filename, log_level, log_output)
 
     SessionFactory = get_session_factory(get_engine())
@@ -119,9 +120,9 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
     session.close()
 
 def process_page(page_url, stats_collector, log_level, log_output):
-    global MACHINE_ID
+    # global MACHINE_ID
     # Set up logger for this function
-    log_filename = f'logs/html_processor/html_processor_{MACHINE_ID}.log'
+    log_filename = f'logs/html_processor/html_processor_{config.MACHINE_ID}.log'
     html_logger = configure_thread_logging('html_processor', log_filename, log_level, log_output)
 
     html_logger.info(f"Processing page: {page_url}")

@@ -8,11 +8,11 @@ from utils import get_session_factory, configure_thread_logging
 from models import HostLog, Checkpoint, BaseImageUrl, Image, Batch, BatchImage, ArchivedImage
 import socket
 import traceback
-
+import config  # Импортируем модуль конфигурации
 def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_level, log_output):
-    global MACHINE_ID
+    # global MACHINE_ID
     # Set up logger for this function
-    log_filename = f'logs/db_writer/db_writer_{MACHINE_ID}.log'
+    log_filename = f'logs/db_writer/db_writer_{config.MACHINE_ID}.log'
     db_writer_logger = configure_thread_logging('db_writer', log_filename, log_level, log_output)
 
     SessionFactory = get_session_factory(engine)

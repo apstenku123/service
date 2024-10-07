@@ -1,0 +1,5 @@
+Downloader Test Report
+====================
+Files downloaded: 90
+Batch info saved in output_data/batch_info.json
+Logs are saved in logs

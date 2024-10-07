@@ -1,4 +1,5 @@
-# file: tests/test_downloader/test_downloader.py
+# file: test_downloader.py
+# directory: tests/test_downloader
 
 import threading
 import os
@@ -11,12 +12,16 @@ from queue import Queue
 sys.path.append('../../')
 
 from downloader import downloader_thread
-from utils import configure_thread_logging, get_session_factory, setup_database
+from utils import configure_thread_logging, get_engine, get_session_factory, setup_database
 from stats_collector import StatsCollector
 from models import Image, Batch, BatchImage
 import json
+import config  # Импортируем модуль конфигурации
 
 def main():
+    # Устанавливаем переменную окружения MACHINE_ID
+    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
+
     # Директории для входных и выходных данных
     input_dir = 'input_data'
     output_dir = 'output_data'

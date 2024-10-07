@@ -74,7 +74,7 @@ class ImageEmbedding(Base):
     id = Column(Integer, primary_key=True)
     image_id = Column(Integer, ForeignKey('images.id'))
     filename = Column(String, nullable=False)
-    embedding = Column(Vector(512), nullable=False)
+    embedding = Column(Vector(512), nullable=True)
     insightface_embedding = Column(Vector(512), nullable=True)  # Новое поле
 
     image = relationship("Image", back_populates="embeddings")

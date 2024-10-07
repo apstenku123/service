@@ -1,5 +1,6 @@
 service/
     processor.py
+    config.py
     embeddings_writer.py
     archiver.py
     main.py
@@ -8,10 +9,49 @@ service/
     stats_collector.py
     web_server.py
     update_headers.py
+    clean.py
     view_web_server.py
     downloader.py
     models.py
+tests/
+    test_processor/
+        test_processor.py
+        input_data/
+        output_data_backup_1728321321/
+        output_data/
+            reports/
+        logs/
+    test_archiver/
+        archiver.py
+        input_data/
+        output_data/
+        logs/
+    test_downloader/
+        test_downloader.py
+        output_data_backup_1728321213/
+        input_data/
+        output_data/
+            downloads/
+                batch_1/
+        logs/
+            html_processor/
+            db_writer/
+            downloader/
+    test_embeddings_writer/
+        embeddings_writer.py
+        input_data/
+        output_data/
+        logs/
+reports/
 uploads/
 templates/
     index.html
     results.html
+downloads/
+logs/
+    html_processor/
+    embeddings_writer/
+    embedding_processor/
+    db_writer/
+    downloader/
+    main/

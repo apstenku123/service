@@ -7,18 +7,18 @@ import logging
 import time
 from queue import Queue
 from utils import configure_thread_logging, get_engine, setup_database
-from stats_collector import StatsCollector
+from stats_collector import StatsCollector, stats_logger_thread
 from downloader import downloader_thread, get_total_pages_for_query
 from db_writer import db_writer_thread
 from processor import processing_thread
 from embeddings_writer import embeddings_writer_thread
 from archiver import archiver_thread
-from web_server import start_web_server
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1
+import config  # Импортируем модуль конфигурации
 
 def main():
-    global MACHINE_ID
+    # global MACHINE_ID
     parser = argparse.ArgumentParser(description='Script for parsing, downloading, and processing images.')
     parser.add_argument('-l', '--limit', type=int, default=1, help='Number of pages to process')
     parser.add_argument('-s', '--start', type=int, default=1, help='Starting page number')
@@ -38,7 +38,7 @@ def main():
     parser.add_argument('--loggers', type=str, default=os.environ.get('LOGGERS', ''),
                         help='Comma-separated list of loggers to include (default all)')
     parser.add_argument('--archive', action='store_true', help='Enable archiving of images after processing (default False)')
-    parser.add_argument('--archive-type', type=str, choices=['s3', 'azure', 'ftp'], help='Type of archive storage')
+    parser.add_argument('--archive-type', type=str, choices=['s3', 'azure', 'ftp', 'sftp'], help='Type of archive storage')
     parser.add_argument('--archive-config', type=str, help='Path to archive configuration file')
     parser.add_argument('--archive-threads', type=int, default=int(os.environ.get('ARCHIVE_THREADS', 4)),
                         help='Number of archiver threads (default 4)')
@@ -51,7 +51,7 @@ def main():
     args = parser.parse_args()
 
     # Read environment variables
-    MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
+    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
     TOTAL_MACHINES = int(os.environ.get('TOTAL_MACHINES', '1'))
     DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', 'downloads')
     MAX_BATCHES_ON_DISK = int(os.environ.get('MAX_BATCHES_ON_DISK', '5'))
@@ -85,7 +85,7 @@ def main():
     else:
         archive_config = {}
 
-    print(f"MACHINE_ID: {MACHINE_ID}, TOTAL_MACHINES: {TOTAL_MACHINES}, DOWNLOAD_DIR: {DOWNLOAD_DIR}, "
+    print(f"MACHINE_ID: {config.MACHINE_ID}, TOTAL_MACHINES: {TOTAL_MACHINES}, DOWNLOAD_DIR: {DOWNLOAD_DIR}, "
           f"MAX_BATCHES_ON_DISK: {MAX_BATCHES_ON_DISK}, DOWNLOAD_THREADS: {DOWNLOAD_THREADS}, "
           f"BATCH_SIZE: {BATCH_SIZE}, REPORT_DIR: {REPORT_DIR}, STATS_INTERVAL: {STATS_INTERVAL}, "
           f"LOG_LEVEL: {args.log_level}, LOG_OUTPUT: {LOG_OUTPUT}, LOGGERS: {LOGGERS}, "
@@ -97,7 +97,7 @@ def main():
         os.makedirs(REPORT_DIR)
 
     # Set up logging for main
-    log_filename = os.path.join('logs', 'main', f'main_{MACHINE_ID}.log')
+    log_filename = os.path.join('logs', 'main', f'main_{config.MACHINE_ID}.log')
     logger = configure_thread_logging('main', log_filename, LOG_LEVEL, LOG_OUTPUT)
     logger.info("Application started.")
 
@@ -127,16 +127,53 @@ def main():
     stop_event = threading.Event()
 
     # Open log file for images without faces
-    log_file_path = os.path.join('logs', f'images_without_faces_{MACHINE_ID}.log')
+    log_file_path = os.path.join('logs', f'images_without_faces_{config.MACHINE_ID}.log')
     os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
     images_without_faces_log_file = open(log_file_path, 'a')
 
+    # Вычисляем total_pages_to_process перед запуском потоков
+    total_pages_to_process = 0  # Инициализируем переменную
+
+    # Если задан поисковый запрос, обрабатываем его
+    if args.query:
+        search_query = args.query
+        total_pages = get_total_pages_for_query(search_query)
+        total_pages_to_process = total_pages
+        logger.info(f"Total pages for query '{search_query}': {total_pages}")
+
+        for page_num in range(1, total_pages + 1):
+            if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
+                continue  # This page is not for this machine
+
+            page_info = {'page_number': page_num, 'query': search_query}
+            page_queue.put(page_info)
+    else:
+        # Fill the page queue for processing
+        total_pages_to_process = args.limit
+        for page_num in range(args.start, args.start + args.limit):
+            if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
+                continue  # This page is not for this machine
+
+            page_info = {'page_number': page_num, 'query': None}
+            page_queue.put(page_info)
+
     # Start threads
+    stats_logger = threading.Thread(target=stats_logger_thread, args=(
+        stats_collector,
+        STATS_INTERVAL,
+        stop_event,
+        LOG_LEVEL,
+        LOG_OUTPUT,
+        total_pages_to_process,  # Передаем total_pages_to_process
+        page_queue,
+        batch_queue,
+        embeddings_queue,
+        db_queue
+    ))
     db_writer = threading.Thread(target=db_writer_thread, args=(db_queue, batch_ready_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
     downloader = threading.Thread(target=downloader_thread, args=(page_queue, batch_queue, db_queue, batch_ready_queue, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector, LOG_LEVEL, LOG_OUTPUT, archive_enabled))
     embeddings_writer = threading.Thread(target=embeddings_writer_thread, args=(embeddings_queue, db_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
     processor = threading.Thread(target=processing_thread, args=(batch_queue, embeddings_queue, archive_queue, model, mtcnn, device, engine, BATCH_SIZE, REPORT_DIR, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file))
-    stats_logger = threading.Thread(target=stats_logger_thread, args=(stats_collector, STATS_INTERVAL, stop_event, LOG_LEVEL, LOG_OUTPUT, page_queue, batch_queue, embeddings_queue, db_queue))
 
     archiver_threads = []
     if archive_enabled:
@@ -153,28 +190,7 @@ def main():
 
     logger.info("All threads started.")
 
-    # Если задан поисковый запрос, обрабатываем его
-    if args.query:
-        search_query = args.query
-        total_pages = get_total_pages_for_query(search_query)
-        logger.info(f"Total pages for query '{search_query}': {total_pages}")
-
-        for page_num in range(1, total_pages + 1):
-            if (page_num % TOTAL_MACHINES) != MACHINE_ID:
-                continue  # This page is not for this machine
-
-            page_info = {'page_number': page_num, 'query': search_query}
-            page_queue.put(page_info)
-    else:
-        # Fill the page queue for processing
-        for page_num in range(args.start, args.start + args.limit):
-            if (page_num % TOTAL_MACHINES) != MACHINE_ID:
-                continue  # This page is not for this machine
-
-            page_info = {'page_number': page_num, 'query': None}
-            page_queue.put(page_info)
-
-    # Finish the page queue
+    # Завершаем очередь страниц
     page_queue.put(None)
     page_queue.join()
 

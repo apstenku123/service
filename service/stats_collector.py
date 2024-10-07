@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from logging.handlers import RotatingFileHandler
-
+import config  # Импортируем модуль конфигурации
 
 class StatsCollector:
     def __init__(self):
@@ -124,8 +124,8 @@ def configure_thread_logging(logger_name, log_filename, log_level, log_output):
 
 # Statistics logging thread
 def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_output, total_pages_to_process, page_queue, batch_queue, embeddings_queue, db_queue):
-    global MACHINE_ID
-    stats_logger = configure_thread_logging('stats_logger', f'logs/stats_logger/stats_logger_{MACHINE_ID}.log', log_level, log_output)
+    # global MACHINE_ID
+    stats_logger = configure_thread_logging('stats_logger', f'logs/stats_logger/stats_logger_{config.MACHINE_ID}.log', log_level, log_output)
 
     while not stop_event.is_set():
         time.sleep(interval)

@@ -1,4 +1,5 @@
-# file: tests/test_embeddings_writer/test_embeddings_writer.py
+# file: embeddings_writer.py
+# directory: tests/test_embeddings_writer
 
 import threading
 import os
@@ -11,12 +12,15 @@ from queue import Queue
 sys.path.append('../../')
 
 from embeddings_writer import embeddings_writer_thread
-from utils import configure_thread_logging, get_engine, setup_database
+from utils import configure_thread_logging, get_engine, get_session_factory, setup_database
 from stats_collector import StatsCollector
 from models import ImageEmbedding, Image
 import json
-
+import config  # Импортируем модуль конфигурации
 def main():
+    # Устанавливаем переменную окружения MACHINE_ID
+    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
+
     # Директории для входных и выходных данных
     input_dir = 'input_data'
     output_dir = 'output_data'
@@ -58,6 +62,11 @@ def main():
             if db_task is None:
                 db_queue.task_done()
                 break
+            db_task_type, data = db_task
+            if db_task_type == 'mark_batch_processed':
+                batch_id = data
+                # Здесь можно имитировать обработку
+                pass
             db_queue.task_done()
 
     db_consumer_thread = threading.Thread(target=db_queue_consumer, args=(db_queue,))
