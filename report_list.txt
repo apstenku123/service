@@ -1,0 +1,11 @@
+service/
+    processor.py
+    embeddings_writer.py
+    archiver.py
+    main.py
+    utils.py
+    db_writer.py
+    stats_collector.py
+    web_server.py
+    downloader.py
+    models.py
