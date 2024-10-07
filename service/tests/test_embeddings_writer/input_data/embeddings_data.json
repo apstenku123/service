@@ -1,0 +1,14 @@
+[
+    {
+        "image_id": 0,
+        "filename": "image_0.jpg",
+        "embedding": [0.1, 0.2, ..., 0.512],  # Вектор размерности 512
+        "insightface_embedding": [0.1, 0.2, ..., 0.512]
+    },
+    {
+        "image_id": 1,
+        "filename": "image_1.jpg",
+        "embedding": [0.1, 0.2, ..., 0.512],
+        "insightface_embedding": [0.1, 0.2, ..., 0.512]
+    }
+]

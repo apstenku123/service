@@ -1,0 +1,148 @@
+<!-- file: index.html -->
+<!-- directory: templates -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Поиск похожих изображений</title>
+    <!-- Bootstrap CSS -->
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+    <style>
+        .upload-container {
+            margin-top: 50px;
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+        }
+        .upload-area.hover {
+            background-color: #f8f8f8;
+        }
+        .message {
+            margin-top: 20px;
+            color: red;
+        }
+        #imagePreview {
+            margin-top: 20px;
+            max-width: 100%;
+            height: auto;
+        }
+        .btn-upload {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container upload-container">
+        <h1 class="text-center">Найти похожие лица</h1>
+        {% if message %}
+            <p class="message text-center">{{ message }}</p>
+        {% endif %}
+        <form id="uploadForm" method="POST" enctype="multipart/form-data" class="text-center">
+            <div id="uploadArea" class="upload-area">
+                <p>Перетащите изображение сюда или нажмите для выбора файла</p>
+                <input type="file" id="imageInput" name="image" accept="image/*" style="display: none;" required>
+                <img id="imagePreview" src="#" alt="Превью изображения" style="display: none;">
+            </div>
+            <button type="submit" class="btn btn-primary btn-upload" style="display: none;">Найти похожие изображения</button>
+        </form>
+    </div>
+
+    <!-- Скрипты -->
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const imageInput = document.getElementById('imageInput');
+        const imagePreview = document.getElementById('imagePreview');
+        const uploadForm = document.getElementById('uploadForm');
+        const uploadButton = document.querySelector('.btn-upload');
+
+        let droppedFile = null;
+
+        // Обработчик клика по области загрузки
+        uploadArea.addEventListener('click', () => {
+            imageInput.click();
+        });
+
+        // Обработчик перетаскивания файла в область загрузки
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            uploadArea.classList.add('hover');
+        });
+
+        uploadArea.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            uploadArea.classList.remove('hover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            uploadArea.classList.remove('hover');
+
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                droppedFile = files[0];
+                previewImage(droppedFile);
+                // Автоматически отправляем форму
+                submitForm();
+            }
+        });
+
+        // Обработчик изменения файла в input
+        imageInput.addEventListener('change', () => {
+            if (imageInput.files && imageInput.files[0]) {
+                droppedFile = imageInput.files[0];
+                previewImage(droppedFile);
+                // Автоматически отправляем форму
+                submitForm();
+            }
+        });
+
+        // Функция отправки формы
+        function submitForm() {
+            if (droppedFile) {
+                const formData = new FormData();
+                formData.append('image', droppedFile);
+
+                fetch('/', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.text())
+                .then(data => {
+                    // Заменяем содержимое страницы на полученный HTML
+                    document.open();
+                    document.write(data);
+                    document.close();
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Произошла ошибка при отправке запроса.');
+                });
+            } else {
+                alert('Пожалуйста, выберите изображение.');
+            }
+        }
+
+        // Обработчик отправки формы (не обязателен, можно удалить)
+        uploadForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            submitForm();
+        });
+
+        // Функция предпросмотра изображения
+        function previewImage(file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                imagePreview.src = e.target.result;
+                imagePreview.style.display = 'block';
+            }
+            reader.readAsDataURL(file);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+<!-- file: results.html -->
+<!-- directory: templates -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Similar Images</title>
+    <!-- Bootstrap CSS -->
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+    <style>
+        .results-container {
+            margin-top: 50px;
+        }
+        .image-grid {
+            display: flex;
+            flex-wrap: wrap;
+        }
+        .image-grid-item {
+            flex: 1 0 50%; /* 2 columns */
+            padding: 10px;
+        }
+        .image-grid-item img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 0 auto;
+        }
+        .back-link {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container results-container">
+        <h1 class="text-center">Similar Images</h1>
+        <div class="image-grid">
+            {% for image_url in images %}
+            <div class="image-grid-item">
+                <img src="{{ image_url }}" alt="Similar Image">
+            </div>
+            {% endfor %}
+        </div>
+        <div class="text-center back-link">
+            <a href="{{ url_for('index') }}" class="btn btn-secondary">Upload Another Image</a>
+        </div>
+    </div>
+</body>
+</html>

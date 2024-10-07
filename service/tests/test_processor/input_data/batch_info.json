@@ -1,0 +1,7 @@
+{
+    "batch_id": 1,
+    "batch_dir": "input_data/images",
+    "image_ids": [0, 1],
+    "filenames": ["image_0.jpg", "image_1.jpg"],
+    "image_urls": ["http://example.com/image_0.jpg", "http://example.com/image_1.jpg"]
+}
