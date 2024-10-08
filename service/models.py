@@ -145,16 +145,15 @@ class BatchLog(Base):
     )
 
 
-# New model for archived images
 class ArchivedImage(Base):
     __tablename__ = 'archived_images'
     id = Column(Integer, primary_key=True)
-    image_id = Column(Integer, ForeignKey('images.id'), nullable=False, unique=True)
-    archive_url = Column(String, nullable=False)
+    image_id = Column(Integer, ForeignKey('images.id'), nullable=False)  # Добавлено поле внешнего ключа
+    filename = Column(String, index=True)
+    archive_url = Column(String)
     image = relationship("Image", back_populates="archived_image")
 
     __table_args__ = (
-        Index('idx_archived_images_image_id', 'image_id'),
         Index('idx_archived_images_archive_url', 'archive_url'),
     )
 
