@@ -1,11 +1,13 @@
 # file: stats_collector.py
 # directory: .
+
 import logging
 import os
 import threading
 import time
 from logging.handlers import RotatingFileHandler
 import config  # Импортируем модуль конфигурации
+
 
 class StatsCollector:
     def __init__(self):
@@ -25,7 +27,12 @@ class StatsCollector:
         self.images_with_faces = 0
         self.images_without_faces = 0
         self.total_batches_archived = 0
+        self.batches_processed_by_processor = 0
         self.start_time = time.time()
+
+    def increment_batches_processed_by_processor(self, count=1):
+        with self.lock:
+            self.batches_processed_by_processor += count
 
     def increment_files_downloaded(self, count=1):
         with self.lock:
@@ -76,6 +83,7 @@ class StatsCollector:
                 'batch_processing_times': self.batch_processing_times.copy(),
                 'elapsed_time': time.time() - self.last_reset_time,
                 # Global stats
+                'batches_processed_by_processor': self.batches_processed_by_processor,
                 'total_files_downloaded': self.total_files_downloaded,
                 'total_faces_found': self.total_faces_found,
                 'total_embeddings_uploaded': self.total_embeddings_uploaded,
@@ -120,7 +128,6 @@ def configure_thread_logging(logger_name, log_filename, log_level, log_output):
         logger.addHandler(handler)
 
     return logger
-
 
 # Statistics logging thread
 def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_output, total_pages_to_process, page_queue, batch_queue, embeddings_queue, db_queue):

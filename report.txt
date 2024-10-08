@@ -21,26 +21,27 @@ templates/
 
 # file: processor.py
 # directory: .
+
 import os
 import time
 import torch
-from utils import configure_thread_logging, get_session_factory, preprocess_image
-from models import Batch, Image, BatchImage, BatchLog, HostLog
+import cv2
+import shutil
 import socket
 import traceback
 import numpy as np
 
-# Импортируем необходимые модули для InsightFace
+from utils import configure_thread_logging, get_session_factory
+from models import Batch, Image, BatchImage, BatchLog, HostLog
 from insightface.app import FaceAnalysis
-import cv2
 import config  # Импортируем модуль конфигурации
-def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn, device, engine, batch_size, report_dir, stats_collector, log_level, log_output, images_without_faces_log_file):
-    # global MACHINE_ID
+
+
+def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engine, batch_size, report_dir, stats_collector, log_level, log_output, images_without_faces_log_file, condition):
     # Set up logger for this function
     log_filename = f'logs/embedding_processor/embedding_processor_{config.MACHINE_ID}.log'
     embedding_processor_logger = configure_thread_logging('embedding_processor', log_filename, log_level, log_output)
 
-    cycle_iterator = 0
     # Get host name
     host_name = socket.gethostname()
 
@@ -57,9 +58,10 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
     else:
         host_log = existing_host_log
 
-    # Инициализируем модель InsightFace
-    app = FaceAnalysis(allowed_modules=['recognition'], providers=['CUDAExecutionProvider']) # , 'CPUExecutionProvider'])
+    # Инициализируем модель FaceAnalysis из InsightFace
+    app = FaceAnalysis(providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
     app.prepare(ctx_id=0 if device.type == 'cuda' else -1)
+    # app.max_num_faces = 4  # Опционально ограничить количество лиц
 
     while True:
         batch_info = batch_queue.get()
@@ -73,10 +75,8 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
         image_ids = batch_info['image_ids']
         filenames = batch_info['filenames']
         image_urls = batch_info['image_urls']
-
-        # Create mapping from filename to image_url and image_id
-        filename_to_url = dict(zip(filenames, image_urls))
         filename_to_id = dict(zip(filenames, image_ids))
+        filename_to_url = dict(zip(filenames, image_urls))
 
         # Check if batch is already processed
         batch = session.query(Batch).filter_by(id=batch_id).first()
@@ -88,118 +88,49 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
         embedding_processor_logger.info(f"Starting processing of batch {batch_id}")
         embeddings_data = []
         try:
-            images = session.query(Image).join(BatchImage).filter(BatchImage.batch_id == batch_id).all()
-            image_paths = []
-            image_ids_list = []
-            filenames_list = []
-            for img in images:
-                local_path = os.path.join(batch_dir, img.filename)
-                if not os.path.exists(local_path):
-                    embedding_processor_logger.error(f"File not found: {local_path}")
-                    continue
-                image_paths.append(local_path)
-                image_ids_list.append(img.id)
-                filenames_list.append(img.filename)
-
-            # Preprocess images (load and convert)
-            images_data_list = []
+            image_paths = [os.path.join(batch_dir, filename) for filename in filenames]
             valid_image_ids = []
             valid_filenames = []
+            valid_image_urls = []
+            images_data = []
+
             for idx, path in enumerate(image_paths):
-                img_rgb = preprocess_image(path)
-                if img_rgb is not None:
-                    images_data_list.append(img_rgb)
-                    valid_image_ids.append(image_ids_list[idx])
-                    valid_filenames.append(filenames_list[idx])
+                img = cv2.imread(path)
+                if img is not None:
+                    images_data.append(img)
+                    valid_image_ids.append(filename_to_id[filenames[idx]])
+                    valid_filenames.append(filenames[idx])
+                    valid_image_urls.append(filename_to_url[filenames[idx]])
                 else:
                     embedding_processor_logger.error(f"Failed to load image: {path}")
 
-            total_images = len(images_data_list)
+            total_images = len(images_data)
             total_faces = 0
             images_with_faces = 0
             images_without_faces = 0
 
-            # Process images in batches
-            num_batches = (total_images + batch_size - 1) // batch_size
-            for batch_idx in range(num_batches):
-                batch_start = batch_idx * batch_size
-                batch_end = min((batch_idx + 1) * batch_size, total_images)
-                batch_images = images_data_list[batch_start:batch_end]
-                batch_image_ids = valid_image_ids[batch_start:batch_end]
-                batch_filenames = valid_filenames[batch_start:batch_end]
-
-                # Detect faces using MTCNN in batch
-                try:
-                    boxes_list, _ = mtcnn.detect(batch_images)
-                except Exception as e:
-                    embedding_processor_logger.error(f"Face detection error in batch {batch_idx}: {e}")
-                    continue
-
-                # Collect faces and metadata
-                face_imgs = []
-                face_image_ids = []
-                face_filenames = []
-                for idx_in_batch, boxes in enumerate(boxes_list):
-                    if boxes is None:
-                        images_without_faces += 1
-                        stats_collector.increment_images_without_faces()
-                        embedding_processor_logger.info(f"No faces detected in image: {batch_filenames[idx_in_batch]}")
-                        # Write full URL to log file
-                        full_url = filename_to_url[batch_filenames[idx_in_batch]]
-                        images_without_faces_log_file.write(f"{full_url}\n")
-                        continue
-
+            for idx_in_batch, img in enumerate(images_data):
+                faces = app.get(img)
+                num_faces = len(faces)
+                total_faces += num_faces
+                if num_faces > 0:
                     images_with_faces += 1
-                    stats_collector.increment_images_with_faces()
-                    num_faces = boxes.shape[0]
-                    total_faces += num_faces
                     stats_collector.increment_faces_found(num_faces)
-
-                    for face_idx, box in enumerate(boxes):
-                        x1, y1, x2, y2 = box.astype(int)
-                        face_img = batch_images[idx_in_batch][y1:y2, x1:x2]
-                        face_imgs.append(face_img)
-                        face_image_ids.append(batch_image_ids[idx_in_batch])
-                        face_filenames.append(batch_filenames[idx_in_batch])
-
-                if not face_imgs:
-                    continue
-
-                # Prepare faces for InceptionResnetV1
-                face_tensors = []
-                for face_img in face_imgs:
-                    face_tensor = preprocess_face(face_img, device)
-                    face_tensors.append(face_tensor)
-                face_tensors = torch.stack(face_tensors).to(device)
-
-                # Get embeddings from InceptionResnetV1
-                with torch.no_grad():
-                    embeddings = model(face_tensors).cpu().numpy()
-
-                # Prepare faces for InsightFace
-                face_inputs = []
-                for face_img in face_imgs:
-                    face_input = preprocess_face_insightface(face_img)
-                    face_inputs.append(face_input)
-                face_inputs = np.vstack(face_inputs)
-
-                # Get embeddings from InsightFace in batch
-                recognition_model = app.models.get('recognition', None)
-                if recognition_model is None:
-                    insightface_embeddings = [None] * len(face_imgs)
+                    stats_collector.increment_images_with_faces()
+                    for face in faces:
+                        embedding = face.embedding.flatten().tolist()
+                        embeddings_data.append({
+                            'image_id': valid_image_ids[idx_in_batch],
+                            'filename': valid_filenames[idx_in_batch],
+                            'embedding': embedding
+                        })
                 else:
-                    insightface_embeddings = recognition_model(face_inputs).tolist()
+                    images_without_faces += 1
+                    stats_collector.increment_images_without_faces()
+                    embedding_processor_logger.info(f"No faces detected in image: {valid_filenames[idx_in_batch]}")
 
-                # Collect embeddings data
-                for idx_face in range(len(face_imgs)):
-                    embedding = embeddings[idx_face].tolist()
-                    insightface_embedding = insightface_embeddings[idx_face]
-                    embeddings_data.append({
-                        'image_id': face_image_ids[idx_face],
-                        'filename': face_filenames[idx_face],
-                        'embedding': embedding,
-                        'insightface_embedding': insightface_embedding
-                    })
+                    # Write image URL to log file
+                    images_without_faces_log_file.write(f"{valid_image_urls[idx_in_batch]}\n")
 
             # Pass data for saving to database
             embeddings_queue.put((batch_id, embeddings_data))
@@ -227,6 +158,10 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
             # Mark images as processed
             session.query(Image).filter(Image.id.in_(valid_image_ids)).update({"processed": True}, synchronize_session=False)
 
+            # Mark batch as processed
+            batch.processed = True
+            session.commit()
+
             # Update statistics
             stats_collector.increment_images_processed(len(valid_image_ids))
             stats_collector.increment_batches_processed()
@@ -236,17 +171,14 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
             session.add(batch_log)
             session.commit()
 
-            # After processing, add batch to archive queue
-            archive_info = {
-                'batch_id': batch_id,
-                'batch_dir': batch_dir,
-                'filenames': filenames,
-                'image_ids': image_ids,
-                'filename_to_id': filename_to_id,
-                'filename_to_url': filename_to_url,
-            }
-            archive_queue.put(archive_info)
-            embedding_processor_logger.info(f"Batch {batch_id} added to archive queue.")
+            # Remove batch directory
+            shutil.rmtree(batch_dir)
+            embedding_processor_logger.info(f"Removed temporary directory for batch {batch_id}")
+
+            # Decrement the counter and notify downloader
+            with condition:
+                config.current_batches_on_disk -= 1
+                condition.notify()
 
             batch_queue.task_done()
         except Exception as e:
@@ -257,41 +189,8 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
 
         processing_time = time.time() - start_time
         stats_collector.add_batch_processing_time('embedding_processor', processing_time)
-
-        cycle_iterator += 1
-        if cycle_iterator % 16 == 0:
-            torch.cuda.empty_cache()
-
         time.sleep(1)  # Small delay to reduce load
     session.close()
-
-def preprocess_face(face_img, device):
-    from PIL import Image
-    from torchvision import transforms
-
-    face_img = Image.fromarray(face_img)
-    preprocess = transforms.Compose([
-        transforms.Resize((160, 160)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
-    face_tensor = preprocess(face_img).to(device)
-    return face_tensor
-
-def preprocess_face_insightface(face_img):
-    # Преобразуем изображение в BGR, если оно в RGB
-    if face_img.shape[2] == 3:
-        face_img_bgr = cv2.cvtColor(face_img, cv2.COLOR_RGB2BGR)
-    else:
-        face_img_bgr = face_img
-
-    # Предобрабатываем лицо для InsightFace
-    face_img_resized = cv2.resize(face_img_bgr, (112, 112))
-    face_img_normalized = cv2.cvtColor(face_img_resized, cv2.COLOR_BGR2RGB)
-    face_img_normalized = (face_img_normalized / 127.5) - 1.0  # Нормализация от -1 до 1
-    face_img_transposed = np.transpose(face_img_normalized, (2, 0, 1))  # HWC to CHW
-    face_img_input = np.expand_dims(face_img_transposed, axis=0).astype(np.float32)
-    return face_img_input
 
 ----
 
@@ -299,19 +198,22 @@ def preprocess_face_insightface(face_img):
 # directory: .
 
 MACHINE_ID = 0
+current_batches_on_disk = 0
 ----
 
 # file: embeddings_writer.py
 # directory: .
-import threading
+
 import time
 import traceback
+import socket
+
 from utils import configure_thread_logging, get_session_factory
 from models import ImageEmbedding, HostLog
-import socket
 import config  # Импортируем модуль конфигурации
+
+
 def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector, log_level, log_output):
-    # global MACHINE_ID
     # Set up logger for this function
     log_filename = f'logs/embeddings_writer/embeddings_writer_{config.MACHINE_ID}.log'
     embeddings_writer_logger = configure_thread_logging('embeddings_writer', log_filename, log_level, log_output)
@@ -350,7 +252,6 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_objects = []
             for data in embeddings_data:
                 embedding_vector = data['embedding']
-                insightface_embedding_vector = data['insightface_embedding']
 
                 if not isinstance(embedding_vector, list):
                     embeddings_writer_logger.error(f"Embedding is not a list for image_id {data['image_id']}")
@@ -360,19 +261,10 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
                     embeddings_writer_logger.error(f"Embedding length is not 512 for image_id {data['image_id']}")
                     continue
 
-                # Проверяем наличие эмбеддинга от InsightFace
-                if insightface_embedding_vector is not None and isinstance(insightface_embedding_vector, list):
-                    if len(insightface_embedding_vector) != 512:
-                        embeddings_writer_logger.error(f"InsightFace embedding length is not 512 for image_id {data['image_id']}")
-                        insightface_embedding_vector = None  # Если некорректный размер, сохраняем как None
-                else:
-                    insightface_embedding_vector = None
-
                 embedding = ImageEmbedding(
                     image_id=data['image_id'],
                     filename=data['filename'],
-                    embedding=embedding_vector,
-                    insightface_embedding=insightface_embedding_vector  # Новое поле
+                    insightface_embedding=embedding_vector
                 )
                 embeddings_objects.append(embedding)
             session.bulk_save_objects(embeddings_objects)
@@ -388,8 +280,7 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_writer_logger.info(f"Embeddings for batch {batch_id} saved successfully.")
         except Exception as e:
             session.rollback()
-            embeddings_writer_logger.error(f"Error saving embeddings for batch {batch_id}: {e}")
-            embeddings_writer_logger.debug(traceback.format_exc())
+            embeddings_writer_logger.error(f"Error saving embeddings for batch {batch_id}: {e}", exc_info=True)
         finally:
             embeddings_queue.task_done()
 
@@ -402,21 +293,28 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
 
 # file: archiver.py
 # directory: .
+
 import threading
 import time
 import os
 import shutil
 import traceback
+import socket
+
 from utils import configure_thread_logging, get_session_factory
 from models import ArchivedImage, HostLog
-import boto3
-from azure.storage.blob import BlobServiceClient
-import ftplib
-import paramiko
-import socket
 import config  # Импортируем модуль конфигурации
+
+# Импортируем функции архивации из оригинального archiver.py
+from archiver_functions import (
+    archive_batch_to_s3,
+    archive_batch_to_azure_blob,
+    archive_batch_to_ftp,
+    archive_batch_to_sftp,
+)
+
+
 def archiver_thread(archive_queue, engine, archive_type, archive_config, stats_collector, log_level, log_output):
-    # global MACHINE_ID
     # Set up logger for this function
     log_filename = f'logs/archiver/archiver_{config.MACHINE_ID}.log'
     archiver_logger = configure_thread_logging('archiver', log_filename, log_level, log_output)
@@ -445,7 +343,7 @@ def archiver_thread(archive_queue, engine, archive_type, archive_config, stats_c
         batch_dir = archive_info['batch_dir']
         filenames = archive_info['filenames']
         image_ids = archive_info['image_ids']
-        filename_to_id = archive_info['filename_to_id']
+        filename_to_id = dict(zip(filenames, image_ids))
 
         archiver_logger.info(f"Starting archiving for batch {batch_id}")
 
@@ -482,6 +380,7 @@ def archiver_thread(archive_queue, engine, archive_type, archive_config, stats_c
         time.sleep(1)  # Small delay to reduce load
     session.close()
 
+
 def archive_batch(batch_dir, batch_id, archive_type, archive_config, logger):
     if archive_type == 's3':
         return archive_batch_to_s3(batch_dir, archive_config, logger)
@@ -495,145 +394,42 @@ def archive_batch(batch_dir, batch_id, archive_type, archive_config, logger):
         logger.error(f"Unknown archive type: {archive_type}")
         return {}
 
-def archive_batch_to_s3(batch_dir, archive_config, logger):
-    s3_endpoint = archive_config.get('s3_endpoint')
-    s3_access_key = archive_config.get('s3_access_key')
-    s3_secret_key = archive_config.get('s3_secret_key')
-    s3_bucket = archive_config.get('s3_bucket')
-
-    session = boto3.session.Session()
-    s3_client = session.client(
-        service_name='s3',
-        endpoint_url=s3_endpoint,
-        aws_access_key_id=s3_access_key,
-        aws_secret_access_key=s3_secret_key
-    )
-
-    archive_urls = {}
-    for root, dirs, files in os.walk(batch_dir):
-        for file in files:
-            local_path = os.path.join(root, file)
-            s3_key = f"{os.path.basename(batch_dir)}/{file}"
-            try:
-                s3_client.upload_file(local_path, s3_bucket, s3_key)
-                archive_url = f"{s3_endpoint}/{s3_bucket}/{s3_key}"
-                archive_urls[file] = archive_url
-                logger.info(f"Uploaded {file} to S3 at {archive_url}")
-            except Exception as e:
-                logger.error(f"Failed to upload {file} to S3: {e}")
-    return archive_urls
-
-def archive_batch_to_azure_blob(batch_dir, archive_config, logger):
-    connection_string = archive_config.get('azure_connection_string')
-    container_name = archive_config.get('azure_container_name')
-
-    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-    container_client = blob_service_client.get_container_client(container_name)
-
-    archive_urls = {}
-    for root, dirs, files in os.walk(batch_dir):
-        for file in files:
-            local_path = os.path.join(root, file)
-            blob_name = f"{os.path.basename(batch_dir)}/{file}"
-            try:
-                with open(local_path, "rb") as data:
-                    container_client.upload_blob(name=blob_name, data=data)
-                archive_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}"
-                archive_urls[file] = archive_url
-                logger.info(f"Uploaded {file} to Azure Blob at {archive_url}")
-            except Exception as e:
-                logger.error(f"Failed to upload {file} to Azure Blob: {e}")
-    return archive_urls
-
-def archive_batch_to_ftp(batch_dir, archive_config, logger):
-    ftp_host = archive_config.get('ftp_host')
-    ftp_port = archive_config.get('ftp_port', 21)
-    ftp_username = archive_config.get('ftp_username')
-    ftp_password = archive_config.get('ftp_password')
-    ftp_directory = archive_config.get('ftp_directory', '/')
-
-    archive_urls = {}
-    try:
-        ftp = ftplib.FTP()
-        ftp.connect(ftp_host, ftp_port)
-        ftp.login(ftp_username, ftp_password)
-        ftp.cwd(ftp_directory)
-
-        for root, dirs, files in os.walk(batch_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                with open(local_path, 'rb') as f:
-                    ftp.storbinary(f'STOR {file}', f)
-                archive_url = f"ftp://{ftp_host}{ftp_directory}/{file}"
-                archive_urls[file] = archive_url
-                logger.info(f"Uploaded {file} to FTP at {archive_url}")
-        ftp.quit()
-    except Exception as e:
-        logger.error(f"Failed to upload files to FTP: {e}")
-    return archive_urls
-
-def archive_batch_to_sftp(batch_dir, archive_config, logger):
-    sftp_host = archive_config.get('sftp_host')
-    sftp_port = archive_config.get('sftp_port', 22)
-    sftp_username = archive_config.get('sftp_username')
-    sftp_password = archive_config.get('sftp_password')
-    sftp_directory = archive_config.get('sftp_directory', '/')
-
-    archive_urls = {}
-    try:
-        transport = paramiko.Transport((sftp_host, sftp_port))
-        transport.connect(username=sftp_username, password=sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-
-        # Ensure the directory exists
-        try:
-            sftp.chdir(sftp_directory)
-        except IOError:
-            sftp.mkdir(sftp_directory)
-            sftp.chdir(sftp_directory)
-
-        for root, dirs, files in os.walk(batch_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                remote_path = f"{sftp_directory}/{os.path.basename(batch_dir)}/{file}"
-                # Ensure remote directory exists
-                try:
-                    sftp.stat(os.path.dirname(remote_path))
-                except IOError:
-                    sftp.mkdir(os.path.dirname(remote_path))
-                sftp.put(local_path, remote_path)
-                archive_url = f"sftp://{sftp_host}{remote_path}"
-                archive_urls[file] = archive_url
-                logger.info(f"Uploaded {file} to SFTP at {archive_url}")
-        sftp.close()
-        transport.close()
-    except Exception as e:
-        logger.error(f"Failed to upload files to SFTP: {e}")
-    return archive_urls
-
 ----
 
 # file: main.py
 # directory: .
+
 import os
 import argparse
 import threading
 import logging
 import time
+import shutil
+
 from queue import Queue
 from utils import configure_thread_logging, get_engine, setup_database
 from stats_collector import StatsCollector, stats_logger_thread
-from downloader import downloader_thread, get_total_pages_for_query
+from downloader import downloader_thread, get_total_pages_for_query, process_page, download_image
 from db_writer import db_writer_thread
 from processor import processing_thread
 from embeddings_writer import embeddings_writer_thread
-from archiver import archiver_thread
+from archiver import archiver_thread, archive_batch
 import torch
-from facenet_pytorch import MTCNN, InceptionResnetV1
+from insightface.app import FaceAnalysis
 import config  # Импортируем модуль конфигурации
 
+condition = threading.Condition()
+
+# Импортируем необходимые модели и функции
+from models import (
+    Checkpoint, BaseImageUrl, Image, Batch, BatchImage, ImageEmbedding, ArchivedImage, HostLog, BatchLog
+)
+from utils import get_session_factory, configure_thread_logging
+from urllib.parse import urlparse
+import cv2
+
+
 def main():
-    # global MACHINE_ID
     parser = argparse.ArgumentParser(description='Script for parsing, downloading, and processing images.')
     parser.add_argument('-l', '--limit', type=int, default=1, help='Number of pages to process')
     parser.add_argument('-s', '--start', type=int, default=1, help='Starting page number')
@@ -653,7 +449,7 @@ def main():
     parser.add_argument('--loggers', type=str, default=os.environ.get('LOGGERS', ''),
                         help='Comma-separated list of loggers to include (default all)')
     parser.add_argument('--archive', action='store_true', help='Enable archiving of images after processing (default False)')
-    parser.add_argument('--archive-type', type=str, choices=['s3', 'azure', 'ftp'], help='Type of archive storage')
+    parser.add_argument('--archive-type', type=str, choices=['s3', 'azure', 'ftp', 'sftp'], help='Type of archive storage')
     parser.add_argument('--archive-config', type=str, help='Path to archive configuration file')
     parser.add_argument('--archive-threads', type=int, default=int(os.environ.get('ARCHIVE_THREADS', 4)),
                         help='Number of archiver threads (default 4)')
@@ -663,6 +459,10 @@ def main():
     # Добавляем новый аргумент командной строки для поисковой строки
     parser.add_argument('-q', '--query', type=str, help='Search query string')
 
+    # Добавляем аргумент для выбора режима работы
+    parser.add_argument('--mode', type=str, choices=['threaded', 'sequential'], default='threaded',
+                        help='Mode of operation: threaded (default) or sequential for debugging.')
+
     args = parser.parse_args()
 
     # Read environment variables
@@ -670,6 +470,7 @@ def main():
     TOTAL_MACHINES = int(os.environ.get('TOTAL_MACHINES', '1'))
     DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', 'downloads')
     MAX_BATCHES_ON_DISK = int(os.environ.get('MAX_BATCHES_ON_DISK', '5'))
+    config.current_batches_on_disk = 0  # Инициализируем переменную
     DOWNLOAD_THREADS = args.download_threads
     BATCH_SIZE = args.batch_size
     REPORT_DIR = args.report_dir
@@ -723,107 +524,479 @@ def main():
     # Initialize the statistics collector
     stats_collector = StatsCollector()
 
-    # Task queues
-    page_queue = Queue()
-    batch_queue = Queue(maxsize=MAX_BATCHES_ON_DISK)
-    embeddings_queue = Queue()
-    db_queue = Queue()
-    batch_ready_queue = Queue()
-    archive_queue = Queue()
-
     # Initialize models for extracting embeddings
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
-
-    mtcnn = MTCNN(keep_all=True, device=device)
-    model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-
-    # Event to stop the stats logger thread
-    stop_event = threading.Event()
 
     # Open log file for images without faces
     log_file_path = os.path.join('logs', f'images_without_faces_{config.MACHINE_ID}.log')
     os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
     images_without_faces_log_file = open(log_file_path, 'a')
 
-    # Start threads
-    db_writer = threading.Thread(target=db_writer_thread, args=(db_queue, batch_ready_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
-    downloader = threading.Thread(target=downloader_thread, args=(page_queue, batch_queue, db_queue, batch_ready_queue, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector, LOG_LEVEL, LOG_OUTPUT, archive_enabled))
-    embeddings_writer = threading.Thread(target=embeddings_writer_thread, args=(embeddings_queue, db_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
-    processor = threading.Thread(target=processing_thread, args=(batch_queue, embeddings_queue, archive_queue, model, mtcnn, device, engine, BATCH_SIZE, REPORT_DIR, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file))
-    stats_logger = threading.Thread(target=stats_logger_thread, args=(stats_collector, STATS_INTERVAL, stop_event, LOG_LEVEL, LOG_OUTPUT, page_queue, batch_queue, embeddings_queue, db_queue))
-
-    archiver_threads = []
-    if archive_enabled:
-        for _ in range(ARCHIVE_THREADS):
-            archiver = threading.Thread(target=archiver_thread, args=(archive_queue, engine, archive_type, archive_config, stats_collector, LOG_LEVEL, LOG_OUTPUT))
-            archiver_threads.append(archiver)
-            archiver.start()
-
-    db_writer.start()
-    downloader.start()
-    embeddings_writer.start()
-    processor.start()
-    stats_logger.start()
-
-    logger.info("All threads started.")
+    # Вычисляем total_pages_to_process перед запуском потоков
+    total_pages_to_process = 0  # Инициализируем переменную
 
     # Если задан поисковый запрос, обрабатываем его
     if args.query:
         search_query = args.query
         total_pages = get_total_pages_for_query(search_query)
+        total_pages_to_process = total_pages
         logger.info(f"Total pages for query '{search_query}': {total_pages}")
-
-        for page_num in range(1, total_pages + 1):
-            if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
-                continue  # This page is not for this machine
-
-            page_info = {'page_number': page_num, 'query': search_query}
-            page_queue.put(page_info)
     else:
+        total_pages_to_process = args.limit
+
+    mode = args.mode
+
+    if mode == 'threaded':
+        # Task queues
+        page_queue = Queue()
+        batch_queue = Queue()
+        embeddings_queue = Queue()
+        db_queue = Queue()
+        batch_ready_queue = Queue()
+        archive_queue = Queue()
+
+        # Event to stop the stats logger thread
+        stop_event = threading.Event()
+
         # Fill the page queue for processing
+        if args.query:
+            for page_num in range(1, total_pages_to_process + 1):
+                if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
+                    continue  # This page is not for this machine
+
+                page_info = {'page_number': page_num, 'query': search_query}
+                page_queue.put(page_info)
+        else:
+            for page_num in range(args.start, args.start + args.limit):
+                if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
+                    continue  # This page is not for this machine
+
+                page_info = {'page_number': page_num, 'query': None}
+                page_queue.put(page_info)
+
+        # Start threads
+        stats_logger = threading.Thread(target=stats_logger_thread, args=(
+            stats_collector,
+            STATS_INTERVAL,
+            stop_event,
+            LOG_LEVEL,
+            LOG_OUTPUT,
+            total_pages_to_process,  # Передаем total_pages_to_process
+            page_queue,
+            batch_queue,
+            embeddings_queue,
+            db_queue
+        ))
+        db_writer = threading.Thread(target=db_writer_thread, args=(db_queue, batch_ready_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
+        embeddings_writer = threading.Thread(target=embeddings_writer_thread, args=(embeddings_queue, db_queue, engine, stats_collector, LOG_LEVEL, LOG_OUTPUT))
+        downloader = threading.Thread(target=downloader_thread, args=(
+            page_queue, batch_queue, db_queue, batch_ready_queue, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector,
+            LOG_LEVEL, LOG_OUTPUT, archive_enabled, condition, MAX_BATCHES_ON_DISK))
+
+        processor = threading.Thread(target=processing_thread, args=(
+            batch_queue, embeddings_queue, archive_queue, device, engine, BATCH_SIZE, REPORT_DIR, stats_collector,
+            LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file, condition))
+
+        archiver_threads = []
+        if archive_enabled:
+            for _ in range(ARCHIVE_THREADS):
+                archiver = threading.Thread(target=archiver_thread, args=(archive_queue, engine, archive_type, archive_config, stats_collector, LOG_LEVEL, LOG_OUTPUT))
+                archiver_threads.append(archiver)
+                archiver.start()
+
+        db_writer.start()
+        downloader.start()
+        embeddings_writer.start()
+        processor.start()
+        stats_logger.start()
+
+        logger.info("All threads started.")
+
+        # Завершаем очередь страниц
+        page_queue.put(None)
+        page_queue.join()
+
+        # Wait until all batches are processed
+        batch_queue.join()
+        embeddings_queue.join()
+        db_queue.join()
+
+        # Terminate remaining threads
+        batch_queue.put(None)
+        embeddings_queue.put(None)
+        db_queue.put(None)
+        batch_ready_queue.put(None)
+
+        downloader.join()
+        db_writer.join()
+        embeddings_writer.join()
+        processor.join()
+
+        # Close archive queue and wait for archiver threads
+        if archive_enabled:
+            for _ in archiver_threads:
+                archive_queue.put(None)
+            archive_queue.join()
+            for archiver in archiver_threads:
+                archiver.join()
+
+        # Stop the stats logger thread
+        stop_event.set()
+        stats_logger.join()
+
+        # Close the images_without_faces log file
+        images_without_faces_log_file.close()
+        logger.info("All batches processed.")
+    else:
+        # Sequential mode
+        run_sequential(args, total_pages_to_process, DOWNLOAD_DIR, DOWNLOAD_THREADS, device, engine, BATCH_SIZE,
+                       REPORT_DIR, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file,
+                       archive_enabled, archive_type, archive_config, condition, MAX_BATCHES_ON_DISK)
+
+    logger.info("Application finished.")
+
+
+def run_sequential(args, total_pages_to_process, DOWNLOAD_DIR, DOWNLOAD_THREADS, device, engine, BATCH_SIZE,
+                   REPORT_DIR, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file,
+                   archive_enabled, archive_type, archive_config, condition, MAX_BATCHES_ON_DISK):
+    logger = logging.getLogger('sequential')
+    logger.info("Starting sequential processing mode.")
+
+    # Создание сессии базы данных
+    SessionFactory = get_session_factory(engine)
+    session = SessionFactory()
+
+    # Инициализация моделей
+    app = FaceAnalysis(providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
+    app.prepare(ctx_id=0 if device.type == 'cuda' else -1)
+
+    # Генерация списка страниц для обработки
+    page_infos = generate_page_infos(args, total_pages_to_process)
+
+    for page_info in page_infos:
+        # 1. Обработка HTML страницы
+        page_number = page_info['page_number']
+        search_query = page_info.get('query')
+        if search_query:
+            page_url = f"http://camvideos.me/search/{search_query}?page={page_number}"
+        else:
+            page_url = f"http://camvideos.me/?page={page_number}"
+        image_urls = process_page(page_url, stats_collector, LOG_LEVEL, LOG_OUTPUT)
+        if not image_urls:
+            logger.info(f"No images found on page {page_number}.")
+            continue
+
+        # 2. Сохранение батча в базу данных
+        batch_info = store_batch_in_db(page_number, image_urls, session, LOG_LEVEL, LOG_OUTPUT)
+        if not batch_info:
+            logger.info(f"Batch for page {page_number} was not created.")
+            continue
+
+        # **Добавлено: Проверка лимита батчей на диске**
+        with condition:
+            while config.current_batches_on_disk >= MAX_BATCHES_ON_DISK:
+                condition.wait()
+            config.current_batches_on_disk += 1  # Увеличиваем счетчик
+
+        try:
+            # 3. Загрузка изображений
+            batch_info = download_batch_images(batch_info, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector, LOG_LEVEL, LOG_OUTPUT, archive_enabled, session)
+
+            # 4. Обработка эмбеддингов
+            embeddings_data = process_embeddings(batch_info, app, device, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file, session)
+
+            # 5. Сохранение эмбеддингов в базу данных
+            save_embeddings_to_db(batch_info['batch_id'], embeddings_data, session, stats_collector, LOG_LEVEL, LOG_OUTPUT)
+
+            # 6. Архивация изображений (если включена)
+            if archive_enabled:
+                archive_batch_images(batch_info, archive_type, archive_config, session, stats_collector, LOG_LEVEL, LOG_OUTPUT)
+
+            # 7. Обновление статистики и очистка
+            logger.info(f"Completed processing for batch {batch_info['batch_id']}.")
+
+            # Выводим статистику
+            log_stats(stats_collector)
+        finally:
+            # **Добавлено: Уменьшаем счетчик и уведомляем**
+            with condition:
+                config.current_batches_on_disk -= 1
+                condition.notify()
+
+    session.close()
+    logger.info("Sequential processing completed.")
+
+
+def generate_page_infos(args, total_pages_to_process):
+    page_infos = []
+    if args.query:
+        search_query = args.query
+        total_pages = total_pages_to_process
+        for page_num in range(1, total_pages + 1):
+            if (page_num % int(os.environ.get('TOTAL_MACHINES', '1'))) != config.MACHINE_ID:
+                continue
+            page_info = {'page_number': page_num, 'query': search_query}
+            page_infos.append(page_info)
+    else:
         for page_num in range(args.start, args.start + args.limit):
-            if (page_num % TOTAL_MACHINES) != config.MACHINE_ID:
-                continue  # This page is not for this machine
-
+            if (page_num % int(os.environ.get('TOTAL_MACHINES', '1'))) != config.MACHINE_ID:
+                continue
             page_info = {'page_number': page_num, 'query': None}
-            page_queue.put(page_info)
+            page_infos.append(page_info)
+    return page_infos
 
-    # Finish the page queue
-    page_queue.put(None)
-    page_queue.join()
 
-    # Wait until all batches are processed
-    batch_queue.join()
-    embeddings_queue.join()
-    db_queue.join()
+def store_batch_in_db(page_number, image_urls, session, log_level, log_output):
+    db_writer_logger = configure_thread_logging('db_writer_sequential', 'logs/db_writer_sequential.log', log_level, log_output)
+    try:
+        # Проверка существования чекпоинта
+        page_url = f"http://camvideos.me/?page={page_number}"
+        existing_checkpoint = session.query(Checkpoint).filter_by(page_url=page_url).first()
+        if existing_checkpoint:
+            db_writer_logger.info(f"Page {page_url} already processed. Skipping.")
+            return None
+        new_checkpoint = Checkpoint(page_url=page_url)
+        session.add(new_checkpoint)
+        session.commit()
 
-    # Terminate remaining threads
-    batch_queue.put(None)
-    embeddings_queue.put(None)
-    db_queue.put(None)
-    batch_ready_queue.put(None)
+        # Создание base_url
+        base_urls = list(set([f"{urlparse(url).scheme}://{urlparse(url).netloc}" for url in image_urls]))
+        base_url_str = base_urls[0]
+        base_url = BaseImageUrl(base_url=base_url_str)
+        session.add(base_url)
+        session.commit()
 
-    downloader.join()
-    db_writer.join()
-    embeddings_writer.join()
-    processor.join()
+        # Создание батча
+        batch = Batch(page_number=page_number)
+        session.add(batch)
+        session.commit()
 
-    # Close archive queue and wait for archiver threads
-    if archive_enabled:
-        for _ in archiver_threads:
-            archive_queue.put(None)
-        archive_queue.join()
-        for archiver in archiver_threads:
-            archiver.join()
+        # Добавление изображений
+        images_data = []
+        image_filenames = []
+        image_urls_list = []
+        for img_url in image_urls:
+            filename = os.path.basename(urlparse(img_url).path)
+            image = Image(base_url_id=base_url.id, filename=filename)
+            images_data.append(image)
+            image_filenames.append(filename)
+            image_urls_list.append(img_url)
 
-    # Stop the stats logger thread
-    stop_event.set()
-    stats_logger.join()
+        if not images_data:
+            db_writer_logger.info(f"No images to insert for page {page_url}.")
+            return None
 
-    # Close the images_without_faces log file
-    images_without_faces_log_file.close()
-    logger.info("All batches processed.")
+        session.add_all(images_data)
+        session.commit()
+
+        # Создание batch_images
+        batch_images_data = [BatchImage(batch_id=batch.id, image_id=img.id) for img in images_data]
+        session.bulk_save_objects(batch_images_data)
+        session.commit()
+
+        batch_info = {
+            'batch_id': batch.id,
+            'batch_dir': f"batch_{batch.id}",
+            'image_ids': [img.id for img in images_data],
+            'filenames': image_filenames,
+            'image_urls': image_urls_list,
+        }
+        db_writer_logger.info(f"Batch {batch.id} is ready.")
+        return batch_info
+    except Exception as e:
+        session.rollback()
+        db_writer_logger.error(f"Error in store_batch_in_db: {e}", exc_info=True)
+        return None
+
+
+def download_batch_images(batch_info, download_dir, download_threads, stats_collector, log_level, log_output, archive_enabled, session):
+    downloader_logger = configure_thread_logging('downloader_sequential', 'logs/downloader_sequential.log', log_level, log_output)
+    batch_id = batch_info['batch_id']
+    batch_dir_name = batch_info['batch_dir']
+    batch_dir = os.path.join(download_dir, batch_dir_name)
+    os.makedirs(batch_dir, exist_ok=True)
+
+    image_ids = batch_info['image_ids']
+    filenames = batch_info['filenames']
+    image_urls = batch_info['image_urls']
+
+    id_to_filename = dict(zip(image_ids, filenames))
+    id_to_url = dict(zip(image_ids, image_urls))
+
+    images_to_download = []
+    for img_id in image_ids:
+        archived_image = session.query(ArchivedImage).filter_by(image_id=img_id).first()
+        if archived_image and archive_enabled:
+            archive_url = archived_image.archive_url
+            local_path = os.path.join(batch_dir, id_to_filename[img_id])
+            success = download_image(archive_url, local_path, downloader_logger, stats_collector)
+            if not success:
+                images_to_download.append(img_id)
+        else:
+            images_to_download.append(img_id)
+
+    if images_to_download:
+        for img_id in images_to_download:
+            filename = id_to_filename[img_id]
+            img_url = id_to_url[img_id]
+            local_path = os.path.join(batch_dir, filename)
+            success = download_image(img_url, local_path, downloader_logger, stats_collector)
+            if not success:
+                downloader_logger.error(f"Failed to download image {img_url}")
+
+    batch_info['batch_dir'] = batch_dir
+    return batch_info
+
+
+def process_embeddings(batch_info, app, device, stats_collector, log_level, log_output, images_without_faces_log_file, session):
+    embedding_processor_logger = configure_thread_logging('embedding_processor_sequential', 'logs/embedding_processor_sequential.log', log_level, log_output)
+    batch_id = batch_info['batch_id']
+    batch_dir = batch_info['batch_dir']
+    image_ids = batch_info['image_ids']
+    filenames = batch_info['filenames']
+    image_urls = batch_info['image_urls']
+    filename_to_id = dict(zip(filenames, image_ids))
+    filename_to_url = dict(zip(filenames, image_urls))
+
+    embeddings_data = []
+    try:
+        image_paths = [os.path.join(batch_dir, filename) for filename in filenames]
+        valid_image_ids = []
+        valid_filenames = []
+        valid_image_urls = []
+        images_data = []
+
+        for idx, path in enumerate(image_paths):
+            img = cv2.imread(path)
+            if img is not None:
+                images_data.append(img)
+                valid_image_ids.append(filename_to_id[filenames[idx]])
+                valid_filenames.append(filenames[idx])
+                valid_image_urls.append(filename_to_url[filenames[idx]])
+            else:
+                embedding_processor_logger.error(f"Failed to load image: {path}")
+
+        total_images = len(images_data)
+        total_faces = 0
+        images_with_faces = 0
+        images_without_faces = 0
+
+        for idx_in_batch, img in enumerate(images_data):
+            faces = app.get(img)
+            num_faces = len(faces)
+            total_faces += num_faces
+            if num_faces > 0:
+                images_with_faces += 1
+                stats_collector.increment_faces_found(num_faces)
+                stats_collector.increment_images_with_faces()
+                for face in faces:
+                    embedding = face.embedding.flatten().tolist()
+                    embeddings_data.append({
+                        'image_id': valid_image_ids[idx_in_batch],
+                        'filename': valid_filenames[idx_in_batch],
+                        'embedding': embedding
+                    })
+            else:
+                images_without_faces += 1
+                stats_collector.increment_images_without_faces()
+                embedding_processor_logger.info(f"No faces detected in image: {valid_filenames[idx_in_batch]}")
+                images_without_faces_log_file.write(f"{valid_image_urls[idx_in_batch]}\n")
+
+        # Обновление статистики
+        stats_collector.increment_images_processed(len(valid_image_ids))
+        stats_collector.increment_batches_processed()
+
+        # Mark images as processed
+        session.query(Image).filter(Image.id.in_(valid_image_ids)).update({"processed": True}, synchronize_session=False)
+
+        # Mark batch as processed
+        batch = session.query(Batch).filter_by(id=batch_id).first()
+        batch.processed = True
+        session.commit()
+
+        # Удаление временной директории
+        shutil.rmtree(batch_dir)
+        embedding_processor_logger.info(f"Removed temporary directory for batch {batch_id}")
+
+        return embeddings_data
+    except Exception as e:
+        session.rollback()
+        embedding_processor_logger.error(f"Error processing embeddings for batch {batch_id}: {e}", exc_info=True)
+        return []
+
+
+def save_embeddings_to_db(batch_id, embeddings_data, session, stats_collector, log_level, log_output):
+    embeddings_writer_logger = configure_thread_logging('embeddings_writer_sequential', 'logs/embeddings_writer_sequential.log', log_level, log_output)
+    try:
+        if not embeddings_data:
+            embeddings_writer_logger.info(f"No embeddings to save for batch {batch_id}")
+            return
+
+        embeddings_objects = []
+        for data in embeddings_data:
+            embedding_vector = data['embedding']
+            if len(embedding_vector) != 512:
+                embeddings_writer_logger.error(f"Embedding length is not 512 for image_id {data['image_id']}")
+                continue
+
+            embedding = ImageEmbedding(
+                image_id=data['image_id'],
+                filename=data['filename'],
+                insightface_embedding=embedding_vector
+            )
+            embeddings_objects.append(embedding)
+        session.bulk_save_objects(embeddings_objects)
+        session.commit()
+        embeddings_writer_logger.info(f"Embeddings for batch {batch_id} committed to database.")
+        stats_collector.increment_embeddings_uploaded(len(embeddings_objects))
+    except Exception as e:
+        session.rollback()
+        embeddings_writer_logger.error(f"Error saving embeddings for batch {batch_id}: {e}", exc_info=True)
+
+
+def archive_batch_images(batch_info, archive_type, archive_config, session, stats_collector, log_level, log_output):
+    archiver_logger = configure_thread_logging('archiver_sequential', 'logs/archiver_sequential.log', log_level, log_output)
+    batch_id = batch_info['batch_id']
+    batch_dir = batch_info['batch_dir']
+    filenames = batch_info['filenames']
+    image_ids = batch_info['image_ids']
+    filename_to_id = dict(zip(filenames, image_ids))
+
+    archiver_logger.info(f"Starting archiving for batch {batch_id}")
+
+    # Архивация изображений
+    archive_urls = archive_batch(batch_dir, batch_id, archive_type, archive_config, archiver_logger)
+
+    # Сохранение archive_urls в базе данных
+    try:
+        for filename, archive_url in archive_urls.items():
+            img_id = filename_to_id.get(filename)
+            if img_id:
+                archived_image = ArchivedImage(image_id=img_id, archive_url=archive_url)
+                session.add(archived_image)
+        session.commit()
+        archiver_logger.info(f"Archived images for batch {batch_id} stored in database.")
+    except Exception as e:
+        session.rollback()
+        archiver_logger.error(f"Error storing archive URLs for batch {batch_id}: {e}")
+
+    stats_collector.increment_batches_archived()
+
+
+def log_stats(stats_collector):
+    stats = stats_collector.reset()
+    # Формируем сообщение статистики
+    message = (
+        f"Total Images Processed: {stats['total_images_processed']}\n"
+        f"Total Faces Found: {stats['total_faces_found']}\n"
+        f"Images with Faces: {stats['images_with_faces']}\n"
+        f"Images without Faces: {stats['images_without_faces']}\n"
+        f"Total Embeddings Uploaded: {stats['total_embeddings_uploaded']}\n"
+        f"Total Batches Archived: {stats['total_batches_archived']}\n"
+    )
+    print(message)
+
 
 if __name__ == "__main__":
     main()
@@ -832,14 +1005,17 @@ if __name__ == "__main__":
 
 # file: utils.py
 # directory: .
+
 import os
 import logging
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 import cv2
+import requests
 import torch
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 from logging.handlers import RotatingFileHandler
 from models import Base
+
 
 def get_engine():
     DB_HOST = os.environ.get('DB_HOST')
@@ -851,11 +1027,19 @@ def get_engine():
     engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=0)
     return engine
 
+
 def get_session_factory(engine):
     return sessionmaker(bind=engine)
 
+
 def setup_database(engine):
     Base.metadata.create_all(engine)
+    # Создаём расширение vector, если его нет
+
+    with engine.connect() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
+
 
 def preprocess_image(image_path):
     """
@@ -866,6 +1050,7 @@ def preprocess_image(image_path):
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return rgb_image
     return None
+
 
 def configure_thread_logging(logger_name, log_filename, log_level, log_output):
     logger = logging.getLogger(logger_name)
@@ -893,6 +1078,55 @@ def configure_thread_logging(logger_name, log_filename, log_level, log_output):
 
     return logger
 
+
+def download_image(image_url, local_path, logger, stats_collector):
+    try:
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+        with open(local_path, 'wb') as f:
+            f.write(response.content)
+        logger.info(f"Downloaded image: {image_url}")
+        stats_collector.increment_files_downloaded()
+        return True
+    except Exception as e:
+        logger.error(f"Error downloading {image_url}: {e}")
+        return False
+
+def get_face_analysis_model(device):
+    """
+    Returns a FaceAnalysis model from insightface.app.
+    """
+    from insightface.app import FaceAnalysis
+    app = FaceAnalysis(providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
+    app.prepare(ctx_id=0 if device.type == 'cuda' else -1)
+    return app
+
+def get_insightface_embedding(image, app):
+    """
+    Генерирует эмбеддинг с помощью FaceAnalysis из insightface.app.
+    """
+    faces = app.get(image)
+    if faces:
+        # Берем первое обнаруженное лицо
+        face = faces[0]
+        embedding = face.embedding.flatten()
+        return embedding
+    else:
+        return None
+
+def get_facenet_embedding(image, mtcnn, model, device):
+    """
+    Генерирует эмбеддинг с помощью MTCNN и InceptionResnetV1 из facenet_pytorch.
+    """
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    face = mtcnn(img_rgb)
+    if face is not None:
+        face = face.unsqueeze(0).to(device)
+        with torch.no_grad():
+            embedding = model(face).cpu().numpy().flatten()
+        return embedding
+    else:
+        return None
 ----
 
 # file: db_writer.py
@@ -1016,12 +1250,14 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
 
 # file: stats_collector.py
 # directory: .
+
 import logging
 import os
 import threading
 import time
 from logging.handlers import RotatingFileHandler
 import config  # Импортируем модуль конфигурации
+
 
 class StatsCollector:
     def __init__(self):
@@ -1136,7 +1372,6 @@ def configure_thread_logging(logger_name, log_filename, log_level, log_output):
         logger.addHandler(handler)
 
     return logger
-
 
 # Statistics logging thread
 def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_output, total_pages_to_process, page_queue, batch_queue, embeddings_queue, db_queue):
@@ -1438,24 +1673,22 @@ if __name__ == '__main__':
 
 # file: downloader.py
 # directory: .
+
+import os
 import threading
 import time
-
 import requests
-# from queue import Queue
-# from urllib.parse import urlparse
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
 from utils import configure_thread_logging, get_session_factory, get_engine
 from models import ArchivedImage
-# import traceback
 import config  # Импортируем модуль конфигурации
 
-def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads, stats_collector, log_level, log_output, archive_enabled):
-    # global MACHINE_ID
+
+def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads, stats_collector, log_level, log_output, archive_enabled, condition, MAX_BATCHES_ON_DISK):
     # Set up logger for this function
     log_filename = f'logs/downloader/downloader_{config.MACHINE_ID}.log'
     downloader_logger = configure_thread_logging('downloader', log_filename, log_level, log_output)
@@ -1481,6 +1714,12 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
         image_urls = process_page(page_url, stats_collector, log_level, log_output)
 
         if image_urls:
+            # Wait until current_batches_on_disk < MAX_BATCHES_ON_DISK
+            with condition:
+                while config.current_batches_on_disk >= MAX_BATCHES_ON_DISK:
+                    condition.wait()
+                config.current_batches_on_disk += 1  # Increment the counter
+
             # Send task to store batch in the database
             db_queue.put(('store_batch', (page_number, image_urls)))
             # Wait for the batch to be ready
@@ -1557,8 +1796,8 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
         page_queue.task_done()
     session.close()
 
+
 def process_page(page_url, stats_collector, log_level, log_output):
-    # global MACHINE_ID
     # Set up logger for this function
     log_filename = f'logs/html_processor/html_processor_{config.MACHINE_ID}.log'
     html_logger = configure_thread_logging('html_processor', log_filename, log_level, log_output)
@@ -1579,6 +1818,7 @@ def process_page(page_url, stats_collector, log_level, log_output):
 
     html_logger.info(f"Found {len(image_urls)} images on page {page_url}")
     return image_urls
+
 
 def get_total_pages_for_query(query):
     url = f"http://camvideos.me/search/{query}"
@@ -1609,6 +1849,7 @@ def get_total_pages_for_query(query):
         else:
             return 0
 
+
 def download_image(image_url, local_path, downloader_logger, stats_collector):
     try:
         response = requests.get(image_url, timeout=10)
@@ -1626,10 +1867,21 @@ def download_image(image_url, local_path, downloader_logger, stats_collector):
 
 # file: models.py
 # directory: .
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, UniqueConstraint, Index
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Boolean,
+    ForeignKey,
+    DateTime,
+    UniqueConstraint,
+    Index,
+)
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 from pgvector.sqlalchemy import Vector
+
 Base = declarative_base()
 
 # ORM models with indexes defined
@@ -1642,6 +1894,7 @@ class BaseImageUrl(Base):
     __table_args__ = (
         Index('idx_base_image_urls_base_url', 'base_url'),
     )
+
 
 class Image(Base):
     __tablename__ = 'images'
@@ -1659,6 +1912,7 @@ class Image(Base):
         Index('idx_images_processed', 'processed'),
     )
 
+
 class Batch(Base):
     __tablename__ = 'batches'
     id = Column(Integer, primary_key=True)
@@ -1666,11 +1920,13 @@ class Batch(Base):
     created_at = Column(DateTime, default=datetime.now())
     processed = Column(Boolean, default=False)
     images = relationship("BatchImage", back_populates="batch")
+    logs = relationship("BatchLog", back_populates="batch")
 
     __table_args__ = (
         UniqueConstraint('page_number', name='_page_number_uc'),
         Index('idx_batches_processed', 'processed'),
     )
+
 
 class BatchImage(Base):
     __tablename__ = 'batch_images'
@@ -1683,6 +1939,7 @@ class BatchImage(Base):
         Index('idx_batch_images_batch_id', 'batch_id'),
         Index('idx_batch_images_image_id', 'image_id'),
     )
+
 
 class Checkpoint(Base):
     __tablename__ = 'checkpoints'
@@ -1700,7 +1957,7 @@ class ImageEmbedding(Base):
     id = Column(Integer, primary_key=True)
     image_id = Column(Integer, ForeignKey('images.id'))
     filename = Column(String, nullable=False)
-    embedding = Column(Vector(512), nullable=False)
+    embedding = Column(Vector(512), nullable=True)
     insightface_embedding = Column(Vector(512), nullable=True)  # Новое поле
 
     image = relationship("Image", back_populates="embeddings")
@@ -1738,16 +1995,19 @@ class HostLog(Base):
         Index('idx_host_logs_function_name', 'function_name'),
     )
 
+
 class BatchLog(Base):
     __tablename__ = 'batch_logs'
     id = Column(Integer, primary_key=True)
     batch_id = Column(Integer, ForeignKey('batches.id'), nullable=False)
     host_log_id = Column(Integer, ForeignKey('host_logs.id'), nullable=False)
     host_log = relationship("HostLog", back_populates="batches")
+    batch = relationship("Batch", back_populates="logs")
 
     __table_args__ = (
         Index('idx_batch_logs_batch_id', 'batch_id'),
     )
+
 
 # New model for archived images
 class ArchivedImage(Base):
@@ -1761,3 +2021,152 @@ class ArchivedImage(Base):
         Index('idx_archived_images_image_id', 'image_id'),
         Index('idx_archived_images_archive_url', 'archive_url'),
     )
+
+
+class TestEmbedding(Base):
+    __tablename__ = 'test_embeddings'
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String, nullable=False)
+    embedding = Column(Vector(512), nullable=False)
+
+    __table_args__ = (
+        Index('idx_test_embeddings_embedding',
+              'embedding',
+              postgresql_using='ivfflat',
+              postgresql_with={"lists": 100},
+              postgresql_ops={'embedding': 'vector_cosine_ops'}
+              ),
+    )
+----
+
+# file: archiver_functions.py
+# directory: .
+
+import os
+import logging
+
+import boto3
+from azure.storage.blob import BlobServiceClient
+import ftplib
+import paramiko
+
+
+def archive_batch_to_s3(batch_dir, archive_config, logger):
+    s3_endpoint = archive_config.get('s3_endpoint')
+    s3_access_key = archive_config.get('s3_access_key')
+    s3_secret_key = archive_config.get('s3_secret_key')
+    s3_bucket = archive_config.get('s3_bucket')
+
+    session = boto3.session.Session()
+    s3_client = session.client(
+        service_name='s3',
+        endpoint_url=s3_endpoint,
+        aws_access_key_id=s3_access_key,
+        aws_secret_access_key=s3_secret_key
+    )
+
+    archive_urls = {}
+    for root, dirs, files in os.walk(batch_dir):
+        for file in files:
+            local_path = os.path.join(root, file)
+            s3_key = f"{os.path.basename(batch_dir)}/{file}"
+            try:
+                s3_client.upload_file(local_path, s3_bucket, s3_key)
+                archive_url = f"{s3_endpoint}/{s3_bucket}/{s3_key}"
+                archive_urls[file] = archive_url
+                logger.info(f"Uploaded {file} to S3 at {archive_url}")
+            except Exception as e:
+                logger.error(f"Failed to upload {file} to S3: {e}")
+    return archive_urls
+
+
+def archive_batch_to_azure_blob(batch_dir, archive_config, logger):
+    connection_string = archive_config.get('azure_connection_string')
+    container_name = archive_config.get('azure_container_name')
+
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    container_client = blob_service_client.get_container_client(container_name)
+
+    archive_urls = {}
+    for root, dirs, files in os.walk(batch_dir):
+        for file in files:
+            local_path = os.path.join(root, file)
+            blob_name = f"{os.path.basename(batch_dir)}/{file}"
+            try:
+                with open(local_path, "rb") as data:
+                    container_client.upload_blob(name=blob_name, data=data)
+                archive_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+                archive_urls[file] = archive_url
+                logger.info(f"Uploaded {file} to Azure Blob at {archive_url}")
+            except Exception as e:
+                logger.error(f"Failed to upload {file} to Azure Blob: {e}")
+    return archive_urls
+
+
+def archive_batch_to_ftp(batch_dir, archive_config, logger):
+    ftp_host = archive_config.get('ftp_host')
+    ftp_port = archive_config.get('ftp_port', 21)
+    ftp_username = archive_config.get('ftp_username')
+    ftp_password = archive_config.get('ftp_password')
+    ftp_directory = archive_config.get('ftp_directory', '/')
+
+    archive_urls = {}
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(ftp_host, ftp_port)
+        ftp.login(ftp_username, ftp_password)
+        ftp.cwd(ftp_directory)
+
+        for root, dirs, files in os.walk(batch_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                with open(local_path, 'rb') as f:
+                    ftp.storbinary(f'STOR {file}', f)
+                archive_url = f"ftp://{ftp_host}{ftp_directory}/{file}"
+                archive_urls[file] = archive_url
+                logger.info(f"Uploaded {file} to FTP at {archive_url}")
+        ftp.quit()
+    except Exception as e:
+        logger.error(f"Failed to upload files to FTP: {e}")
+    return archive_urls
+
+
+def archive_batch_to_sftp(batch_dir, archive_config, logger):
+    sftp_host = archive_config.get('sftp_host')
+    sftp_port = archive_config.get('sftp_port', 22)
+    sftp_username = archive_config.get('sftp_username')
+    sftp_password = archive_config.get('sftp_password')
+    sftp_directory = archive_config.get('sftp_directory', '/')
+
+    archive_urls = {}
+    try:
+        transport = paramiko.Transport((sftp_host, sftp_port))
+        transport.connect(username=sftp_username, password=sftp_password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+
+        # Ensure the directory exists
+        try:
+            sftp.chdir(sftp_directory)
+        except IOError:
+            sftp.mkdir(sftp_directory)
+            sftp.chdir(sftp_directory)
+
+        for root, dirs, files in os.walk(batch_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                remote_path = f"{sftp_directory}/{os.path.basename(batch_dir)}/{file}"
+                # Ensure remote directory exists
+                try:
+                    sftp.stat(os.path.dirname(remote_path))
+                except IOError:
+                    sftp.mkdir(os.path.dirname(remote_path))
+                sftp.put(local_path, remote_path)
+                archive_url = f"sftp://{sftp_host}{remote_path}"
+                archive_urls[file] = archive_url
+                logger.info(f"Uploaded {file} to SFTP at {archive_url}")
+        sftp.close()
+        transport.close()
+    except Exception as e:
+        logger.error(f"Failed to upload files to SFTP: {e}")
+    return archive_urls

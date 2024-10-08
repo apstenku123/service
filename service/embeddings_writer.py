@@ -1,14 +1,16 @@
 # file: embeddings_writer.py
 # directory: .
-import threading
+
 import time
 import traceback
+import socket
+
 from utils import configure_thread_logging, get_session_factory
 from models import ImageEmbedding, HostLog
-import socket
 import config  # Импортируем модуль конфигурации
+
+
 def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector, log_level, log_output):
-    # global MACHINE_ID
     # Set up logger for this function
     log_filename = f'logs/embeddings_writer/embeddings_writer_{config.MACHINE_ID}.log'
     embeddings_writer_logger = configure_thread_logging('embeddings_writer', log_filename, log_level, log_output)
@@ -47,7 +49,6 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_objects = []
             for data in embeddings_data:
                 embedding_vector = data['embedding']
-                insightface_embedding_vector = data['insightface_embedding']
 
                 if not isinstance(embedding_vector, list):
                     embeddings_writer_logger.error(f"Embedding is not a list for image_id {data['image_id']}")
@@ -57,20 +58,10 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
                     embeddings_writer_logger.error(f"Embedding length is not 512 for image_id {data['image_id']}")
                     continue
 
-                # Проверяем наличие эмбеддинга от InsightFace
-                if insightface_embedding_vector is not None and isinstance(insightface_embedding_vector, list):
-                    if len(insightface_embedding_vector) != 512:
-                        embeddings_writer_logger.error(f"InsightFace embedding length is not 512 for image_id {data['image_id']}")
-                        insightface_embedding_vector = None  # Если некорректный размер, сохраняем как None
-                else:
-                    embeddings_writer_logger.error(f"InsightFace embedding length is none")
-                    insightface_embedding_vector = None
-
                 embedding = ImageEmbedding(
                     image_id=data['image_id'],
                     filename=data['filename'],
-                    embedding=embedding_vector,
-                    insightface_embedding=insightface_embedding_vector  # Новое поле
+                    insightface_embedding=embedding_vector
                 )
                 embeddings_objects.append(embedding)
             session.bulk_save_objects(embeddings_objects)
@@ -86,8 +77,7 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_writer_logger.info(f"Embeddings for batch {batch_id} saved successfully.")
         except Exception as e:
             session.rollback()
-            embeddings_writer_logger.error(f"Error saving embeddings for batch {batch_id}: {e}")
-            embeddings_writer_logger.debug(traceback.format_exc())
+            embeddings_writer_logger.error(f"Error saving embeddings for batch {batch_id}: {e}", exc_info=True)
         finally:
             embeddings_queue.task_done()
 

@@ -1,29 +1,29 @@
-# file: downloader.py
-# directory: .
+import os
 import threading
 import time
-
 import requests
-# from queue import Queue
-# from urllib.parse import urlparse
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from urllib.parse import urlparse
+from functools import partial
 
 from bs4 import BeautifulSoup
 
 from utils import configure_thread_logging, get_session_factory, get_engine
 from models import ArchivedImage
-# import traceback
 import config  # Импортируем модуль конфигурации
 
-def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads, stats_collector, log_level, log_output, archive_enabled):
-    # global MACHINE_ID
+
+def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads,
+                      stats_collector, log_level, log_output, archive_enabled, condition, MAX_BATCHES_ON_DISK):
     # Set up logger for this function
     log_filename = f'logs/downloader/downloader_{config.MACHINE_ID}.log'
     downloader_logger = configure_thread_logging('downloader', log_filename, log_level, log_output)
 
     SessionFactory = get_session_factory(get_engine())
     session = SessionFactory()
+
+    # Создаем ThreadPoolExecutor один раз
+    executor = ThreadPoolExecutor(max_workers=download_threads)
 
     while True:
         page_info = page_queue.get()
@@ -43,6 +43,12 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
         image_urls = process_page(page_url, stats_collector, log_level, log_output)
 
         if image_urls:
+            # Wait until current_batches_on_disk < MAX_BATCHES_ON_DISK
+            with condition:
+                while config.current_batches_on_disk >= MAX_BATCHES_ON_DISK:
+                    condition.wait()
+                config.current_batches_on_disk += 1  # Increment the counter
+
             # Send task to store batch in the database
             db_queue.put(('store_batch', (page_number, image_urls)))
             # Wait for the batch to be ready
@@ -69,47 +75,76 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
             # For each image, check if it's archived
             images_to_download = []
             for img_id in image_ids:
-                archived_image = session.query(ArchivedImage).filter_by(image_id=img_id).first()
-                if archived_image and archive_enabled:
-                    # Attempt to download from archive
-                    archive_url = archived_image.archive_url
-                    local_path = os.path.join(batch_dir, id_to_filename[img_id])
-                    success = download_image(archive_url, local_path, downloader_logger, stats_collector)
-                    if not success:
-                        # If failed, add to download from original source
+                if archive_enabled:
+                    archived_image = session.query(ArchivedImage).filter_by(image_id=img_id).first()
+                    if archived_image:
+                        # Attempt to download from archive
+                        archive_url = archived_image.archive_url
+                        local_path = os.path.join(batch_dir, id_to_filename[img_id])
+                        success = download_image(archive_url, local_path, downloader_logger, stats_collector)
+                        if not success:
+                            # If failed, add to download from original source
+                            images_to_download.append(img_id)
+                    else:
                         images_to_download.append(img_id)
                 else:
                     images_to_download.append(img_id)
 
             # Now download images not found in archive
             if images_to_download:
-                image_download_futures = []
-                with ThreadPoolExecutor(max_workers=download_threads) as executor:
-                    for img_id in images_to_download:
-                        filename = id_to_filename[img_id]
-                        img_url = id_to_url[img_id]
-                        local_path = os.path.join(batch_dir, filename)
-                        future = executor.submit(download_image, img_url, local_path, downloader_logger, stats_collector)
-                        image_download_futures.append(future)
+                # Создаем список для хранения futures данного батча
+                futures = []
 
-                    # Wait for all downloads to complete
-                    for future in as_completed(image_download_futures):
-                        result = future.result()
-                        if not result:
-                            downloader_logger.error(f"Error downloading image in batch {batch_id}")
+                for img_id in images_to_download:
+                    filename = id_to_filename[img_id]
+                    img_url = id_to_url[img_id]
+                    local_path = os.path.join(batch_dir, filename)
+                    future = executor.submit(download_image, img_url, local_path, downloader_logger, stats_collector)
+                    futures.append(future)
+
+                # Ждем завершения всех загрузок для данного батча
+                # Это не блокирует поток загрузчика, так как загрузки выполняются асинхронно
+                wait(futures)
+
+                # Проверяем результаты загрузок
+                failed_downloads = []
+                for future in futures:
+                    result = future.result()
+                    if not result:
+                        failed_downloads.append(future)
+
+                if failed_downloads:
+                    downloader_logger.warning(f"Batch {batch_id} has failed downloads.")
+                    # Вы можете решить, что делать с батчами, у которых есть неудачные загрузки
+                    # Например, можно пропустить их или обработать частично
+                    # В данном случае мы продолжаем и передаем батч на обработку
+                else:
+                    downloader_logger.info(f"All images for batch {batch_id} downloaded successfully.")
+
+                # Теперь, когда все загрузки завершены, добавляем батч в очередь на обработку
+                batch_info = {
+                    'batch_id': batch_id,
+                    'batch_dir': batch_dir,
+                    'image_ids': image_ids,
+                    'filenames': filenames,
+                    'image_urls': image_urls,
+                }
+                batch_queue.put(batch_info)
+                downloader_logger.info(f"Batch {batch_id} added to processing queue.")
             else:
                 downloader_logger.info(f"All images for batch {batch_id} were downloaded from archive.")
 
-            # Now that images are downloaded, add batch to processing queue
-            batch_info = {
-                'batch_id': batch_id,
-                'batch_dir': batch_dir,
-                'image_ids': image_ids,
-                'filenames': filenames,
-                'image_urls': image_urls,
-            }
-            batch_queue.put(batch_info)
-            downloader_logger.info(f"Batch {batch_id} added to processing queue.")
+                # Если нет файлов для загрузки, добавляем батч в очередь на обработку
+                batch_info = {
+                    'batch_id': batch_id,
+                    'batch_dir': batch_dir,
+                    'image_ids': image_ids,
+                    'filenames': filenames,
+                    'image_urls': image_urls,
+                }
+                batch_queue.put(batch_info)
+                downloader_logger.info(f"Batch {batch_id} added to processing queue.")
+
             batch_ready_queue.task_done()
         else:
             downloader_logger.info(f"No images on page {page_url}")
@@ -117,10 +152,13 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
         processing_time = time.time() - start_time
         stats_collector.add_batch_processing_time('downloader', processing_time)
         page_queue.task_done()
+
+    # Ожидаем завершения всех задач перед завершением
+    executor.shutdown(wait=True)
     session.close()
 
+
 def process_page(page_url, stats_collector, log_level, log_output):
-    # global MACHINE_ID
     # Set up logger for this function
     log_filename = f'logs/html_processor/html_processor_{config.MACHINE_ID}.log'
     html_logger = configure_thread_logging('html_processor', log_filename, log_level, log_output)
@@ -141,6 +179,7 @@ def process_page(page_url, stats_collector, log_level, log_output):
 
     html_logger.info(f"Found {len(image_urls)} images on page {page_url}")
     return image_urls
+
 
 def get_total_pages_for_query(query):
     url = f"http://camvideos.me/search/{query}"
@@ -170,6 +209,7 @@ def get_total_pages_for_query(query):
             return 1
         else:
             return 0
+
 
 def download_image(image_url, local_path, downloader_logger, stats_collector):
     try:

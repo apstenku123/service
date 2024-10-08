@@ -1,20 +1,22 @@
 # file: processor.py
 # directory: .
+
 import os
 import time
 import torch
-from utils import configure_thread_logging, get_session_factory
-from models import Batch, Image, BatchImage, BatchLog, HostLog
+import cv2
+import shutil
 import socket
 import traceback
 import numpy as np
-import shutil
 
+from utils import configure_thread_logging, get_session_factory
+from models import Batch, Image, BatchImage, BatchLog, HostLog
 from insightface.app import FaceAnalysis
-import cv2
 import config  # Импортируем модуль конфигурации
 
-def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn, device, engine, batch_size, report_dir, stats_collector, log_level, log_output, images_without_faces_log_file):
+
+def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engine, batch_size, report_dir, stats_collector, log_level, log_output, images_without_faces_log_file, condition):
     # Set up logger for this function
     log_filename = f'logs/embedding_processor/embedding_processor_{config.MACHINE_ID}.log'
     embedding_processor_logger = configure_thread_logging('embedding_processor', log_filename, log_level, log_output)
@@ -36,7 +38,7 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
         host_log = existing_host_log
 
     # Инициализируем модель FaceAnalysis из InsightFace
-    app = FaceAnalysis(providers=['CUDAExecutionProvider'])
+    app = FaceAnalysis(providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
     app.prepare(ctx_id=0 if device.type == 'cuda' else -1)
     # app.max_num_faces = 4  # Опционально ограничить количество лиц
 
@@ -86,35 +88,28 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
             images_with_faces = 0
             images_without_faces = 0
 
-            for i in range(0, total_images, batch_size):
-                batch_imgs = images_data[i:i + batch_size]
-                batch_ids = valid_image_ids[i:i + batch_size]
-                batch_filenames = valid_filenames[i:i + batch_size]
-                batch_image_urls = valid_image_urls[i:i + batch_size]
+            for idx_in_batch, img in enumerate(images_data):
+                faces = app.get(img)
+                num_faces = len(faces)
+                total_faces += num_faces
+                if num_faces > 0:
+                    images_with_faces += 1
+                    stats_collector.increment_faces_found(num_faces)
+                    stats_collector.increment_images_with_faces()
+                    for face in faces:
+                        embedding = face.embedding.flatten().tolist()
+                        embeddings_data.append({
+                            'image_id': valid_image_ids[idx_in_batch],
+                            'filename': valid_filenames[idx_in_batch],
+                            'embedding': embedding
+                        })
+                else:
+                    images_without_faces += 1
+                    stats_collector.increment_images_without_faces()
+                    embedding_processor_logger.info(f"No faces detected in image: {valid_filenames[idx_in_batch]}")
 
-                # Detect faces and get embeddings using InsightFace
-                for idx_in_batch, img in enumerate(batch_imgs):
-                    faces = app.get(img)
-                    num_faces = len(faces)
-                    total_faces += num_faces
-                    if num_faces > 0:
-                        images_with_faces += 1
-                        stats_collector.increment_faces_found(num_faces)
-                        stats_collector.increment_images_with_faces()
-                        for face in faces:
-                            embedding = face.embedding.tolist()
-                            embeddings_data.append({
-                                'image_id': batch_ids[idx_in_batch],
-                                'filename': batch_filenames[idx_in_batch],
-                                'embedding': embedding
-                            })
-                    else:
-                        images_without_faces += 1
-                        stats_collector.increment_images_without_faces()
-                        embedding_processor_logger.info(f"No faces detected in image: {batch_filenames[idx_in_batch]}")
-
-                        # Write image URL to log file
-                        images_without_faces_log_file.write(f"{batch_image_urls[idx_in_batch]}\n")
+                    # Write image URL to log file
+                    images_without_faces_log_file.write(f"{valid_image_urls[idx_in_batch]}\n")
 
             # Pass data for saving to database
             embeddings_queue.put((batch_id, embeddings_data))
@@ -159,6 +154,11 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
             shutil.rmtree(batch_dir)
             embedding_processor_logger.info(f"Removed temporary directory for batch {batch_id}")
 
+            # Decrement the counter and notify downloader
+            with condition:
+                config.current_batches_on_disk -= 1
+                condition.notify()
+
             batch_queue.task_done()
         except Exception as e:
             session.rollback()
@@ -166,6 +166,7 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, model, mtcnn
             embedding_processor_logger.debug(traceback.format_exc())
             batch_queue.task_done()
 
+        stats_collector.increment_batches_processed_by_processor()
         processing_time = time.time() - start_time
         stats_collector.add_batch_processing_time('embedding_processor', processing_time)
         time.sleep(1)  # Small delay to reduce load

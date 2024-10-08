@@ -11,3 +11,4 @@ service/
     view_web_server.py
     downloader.py
     models.py
+    archiver_functions.py
