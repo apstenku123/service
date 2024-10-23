@@ -17,7 +17,6 @@ from pgvector.sqlalchemy import Vector
 
 Base = declarative_base()
 
-# ORM models with indexes defined
 class BaseImageUrl(Base):
     __tablename__ = 'base_image_urls'
     id = Column(Integer, primary_key=True)
@@ -33,6 +32,7 @@ class Image(Base):
     __tablename__ = 'images'
     id = Column(Integer, primary_key=True)
     base_url_id = Column(Integer, ForeignKey('base_image_urls.id'), nullable=False)
+    path = Column(String, nullable=False)  # Поле path должно быть не NULL
     filename = Column(String, nullable=False)
     processed = Column(Boolean, default=False)
     base_image_url = relationship("BaseImageUrl", back_populates="images")
@@ -40,12 +40,12 @@ class Image(Base):
     archived_image = relationship("ArchivedImage", back_populates="image", uselist=False)
 
     __table_args__ = (
-        UniqueConstraint('base_url_id', 'filename', name='_base_image_uc'),
+        UniqueConstraint('base_url_id', 'path', 'filename', name='_base_image_uc'),
         Index('idx_images_base_url_id', 'base_url_id'),
         Index('idx_images_processed', 'processed'),
         Index('idx_images_filename', 'filename'),
+        Index('idx_images_path', 'path'),
     )
-
 
 class Batch(Base):
     __tablename__ = 'batches'

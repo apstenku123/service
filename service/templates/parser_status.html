@@ -1,0 +1,49 @@
+<!-- file: parser_status.html -->
+<!-- directory: templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parser Status</title>
+</head>
+<body>
+    <h1>Parser Status: {{ status }}</h1>
+    <p><strong>Instance ID:</strong> {{ instance_id }}</p>
+    <p><strong>Host Name:</strong> {{ host_name }}</p>
+    <p><strong>Total Servers:</strong> {{ total_servers }}</p>
+    {% if status == 'stopped' %}
+    <form action="/start_parser" method="post">
+        <label for="start">Start Position:</label>
+        <input type="number" id="start" name="start" value="0">
+        <label for="limit">Limit:</label>
+        <input type="number" id="limit" name="limit" value="50">
+        <input type="submit" value="Start Parser">
+    </form>
+    {% else %}
+    <form action="/stop_parser" method="post">
+        <input type="submit" value="Stop Parser">
+    </form>
+    {% endif %}
+    <h2>Current Statistics</h2>
+    <pre>{{ stats | tojson(indent=2) }}</pre>
+    <h2>Run History</h2>
+    <table border="1">
+        <tr>
+            <th>Run ID</th>
+            <th>Start Time</th>
+            <th>End Time</th>
+            <th>Parameters</th>
+            <th>Statistics</th>
+        </tr>
+        {% for run in runs %}
+        <tr>
+            <td>{{ run.id }}</td>
+            <td>{{ run.start_time }}</td>
+            <td>{{ run.end_time }}</td>
+            <td>{{ run.parameters }}</td>
+            <td>{{ run.stats }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <p><a href="/">Refresh</a></p>
+</body>
+</html>

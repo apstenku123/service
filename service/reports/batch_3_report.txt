@@ -1,5 +1,5 @@
 Batch ID: 3
 Total images processed: 90
-Total faces detected: 978
-Images with faces: 79
-Images without faces: 11
+Total faces detected: 1019
+Images with faces: 86
+Images without faces: 4

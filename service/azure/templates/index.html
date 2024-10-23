@@ -1,0 +1,36 @@
+<!-- file: index.html -->
+<!-- directory: azure/templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parsers Dashboard</title>
+</head>
+<body>
+    <h1>Running Parsers</h1>
+    <table border="1">
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>IP Address</th>
+            <th>Assigned ID</th>
+            <th>Is Alive</th>
+            <th>Last Heartbeat</th>
+            <th>Actions</th>
+        </tr>
+        {% for instance in instances %}
+        <tr>
+            <td>{{ instance.id }}</td>
+            <td>{{ instance.name }}</td>
+            <td>{{ instance.ip_address }}</td>
+            <td>{{ instance.assigned_id }}</td>
+            <td>{{ instance.is_alive }}</td>
+            <td>{{ instance.last_heartbeat }}</td>
+            <td>
+                <a href="{{ url_for('instance_detail', instance_id=instance.id) }}">View Details</a> |
+                <a href="http://{{ instance.ip_address }}:8080/">Open Interface</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>

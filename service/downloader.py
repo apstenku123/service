@@ -1,3 +1,5 @@
+# file: downloader.py
+# directory: .
 import os
 import threading
 import time
@@ -151,6 +153,7 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                 'batch_dir': batch_dir,
                 'filenames': filenames,
                 'image_urls': image_urls,
+                'paths': batch_info['paths'],  # Ensure 'paths' are included
             })
 
             # Теперь, когда батч готов и все изображения загружены, добавляем его в очередь на обработку

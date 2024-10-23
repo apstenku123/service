@@ -48,20 +48,18 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             # Save embeddings to database in one transaction
             embeddings_objects = []
             for data in embeddings_data:
-                embedding_vector = data['embedding']
+                embedding_vector = data.get('embedding')
+                insightface_embedding_vector = data.get('insightface_embedding')
 
-                if not isinstance(embedding_vector, list):
-                    embeddings_writer_logger.error(f"Embedding is not a list for image_id {data['image_id']}")
-                    continue
-
-                if len(embedding_vector) != 512:
-                    embeddings_writer_logger.error(f"Embedding length is not 512 for image_id {data['image_id']}")
+                if embedding_vector is None and insightface_embedding_vector is None:
+                    embeddings_writer_logger.error(f"No embeddings for image_id {data['image_id']}")
                     continue
 
                 embedding = ImageEmbedding(
                     image_id=data['image_id'],
                     filename=data['filename'],
-                    insightface_embedding=embedding_vector
+                    embedding=embedding_vector,
+                    insightface_embedding=insightface_embedding_vector
                 )
                 embeddings_objects.append(embedding)
             session.bulk_save_objects(embeddings_objects)
@@ -69,7 +67,8 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_writer_logger.info(f"Embeddings for batch {batch_id} committed to database.")
 
             # Update statistics
-            stats_collector.increment_embeddings_uploaded(len(embeddings_objects))
+            embeddings_count = len(embeddings_objects)
+            stats_collector.increment_embeddings_uploaded(embeddings_count, embedding_type='both')
 
             # Mark batch as processed
             db_queue.put(('mark_batch_processed', batch_id))

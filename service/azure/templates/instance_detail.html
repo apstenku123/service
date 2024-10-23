@@ -1,0 +1,17 @@
+<!-- file: instance_detail.html -->
+<!-- directory: azure/templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Instance Details</title>
+</head>
+<body>
+    <h1>Instance {{ instance.id }} Details</h1>
+    <p><strong>Name:</strong> {{ instance.name }}</p>
+    <p><strong>IP Address:</strong> {{ instance.ip_address }}</p>
+    <p><strong>Assigned ID:</strong> {{ instance.assigned_id }}</p>
+    <p><strong>Is Alive:</strong> {{ instance.is_alive }}</p>
+    <p><strong>Last Heartbeat:</strong> {{ instance.last_heartbeat }}</p>
+    <p><a href="/">Back to Dashboard</a></p>
+</body>
+</html>

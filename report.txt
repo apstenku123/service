@@ -32,9 +32,11 @@ import traceback
 import numpy as np
 
 from utils import configure_thread_logging, get_session_factory
-from models import Batch, Image, BatchImage, BatchLog, HostLog
+from models import Batch, Image, BatchImage, BatchLog, HostLog, ImageEmbedding
+from facenet_pytorch import MTCNN, InceptionResnetV1
 from insightface.app import FaceAnalysis
-import config  # Импортируем модуль конфигурации
+from insightface.utils import face_align
+import config  # Import the configuration module
 
 
 def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engine, batch_size, report_dir, stats_collector, log_level, log_output, images_without_faces_log_file, condition):
@@ -58,10 +60,191 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
     else:
         host_log = existing_host_log
 
-    # Инициализируем модель FaceAnalysis из InsightFace
-    app = FaceAnalysis(providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
-    app.prepare(ctx_id=0 if device.type == 'cuda' else -1)
-    # app.max_num_faces = 4  # Опционально ограничить количество лиц
+    # Initialize MTCNN with keep_all=True
+    mtcnn = MTCNN(keep_all=True, device=device)
+
+    # Initialize InceptionResnetV1 model
+    facenet_model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+    # Initialize InsightFace model
+    app = FaceAnalysis(allowed_modules=['detection', 'recognition'],
+                       providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
+    app.prepare(ctx_id=0 if device.type == 'cuda' else -1, det_size=(640, 640))
+
+    # Get the recognition model
+    recognizer = app.models['recognition']
+
+    # Target size for resizing images for MTCNN
+    mtcnn_target_size = (1280, 960)  # Width x Height
+
+    # MTCNN processing batch size
+    mtcnn_batch_size = 32  # Adjust based on your GPU memory
+
+    # Total images processed across all batches
+    total_images_processed = 0
+
+    # Function to resize image for MTCNN and compute scaling factors
+    def resize_image_for_mtcnn(image, target_size):
+        original_size = image.shape[:2]  # (height, width)
+        h, w = original_size
+        target_w, target_h = target_size
+
+        # Calculate scaling factors
+        scale_w = target_w / w
+        scale_h = target_h / h
+
+        # Resize image
+        resized_image = cv2.resize(image, (target_w, target_h))
+
+        return resized_image, scale_w, scale_h
+
+    # Function to adjust boxes and landmarks back to original image coordinates
+    def adjust_boxes_landmarks(boxes, landmarks, scale_w, scale_h):
+        # Adjust boxes
+        boxes[:, [0, 2]] = boxes[:, [0, 2]] / scale_w
+        boxes[:, [1, 3]] = boxes[:, [1, 3]] / scale_h
+
+        # Adjust landmarks
+        landmarks[:, :, 0] = landmarks[:, :, 0] / scale_w
+        landmarks[:, :, 1] = landmarks[:, :, 1] / scale_h
+
+        return boxes, landmarks
+
+    # Function to process images in batch
+    def process_images_batch(image_paths, valid_image_ids, valid_filenames, valid_image_urls, logger, mtcnn_batch_size):
+        embeddings_data = []
+        total_images_in_batch = len(image_paths)
+        total_faces = 0
+        images_with_faces = 0
+        images_without_faces = 0
+
+        nonlocal total_images_processed  # To update the outer variable
+
+        # Process images in sub-batches for MTCNN
+        for batch_start in range(0, len(image_paths), mtcnn_batch_size):
+            batch_end = batch_start + mtcnn_batch_size
+            batch_image_paths = image_paths[batch_start:batch_end]
+            batch_image_ids = valid_image_ids[batch_start:batch_end]
+            batch_filenames = valid_filenames[batch_start:batch_end]
+            batch_image_urls = valid_image_urls[batch_start:batch_end]
+
+            # Read and preprocess images in the sub-batch
+            images_orig = []
+            images_resized = []
+            scales_w = []
+            scales_h = []
+            valid_indices = []
+
+            for idx, image_path in enumerate(batch_image_paths):
+                img_bgr_orig = cv2.imread(image_path)
+                if img_bgr_orig is None:
+                    logger.error(f"Failed to load image: {image_path}")
+                    continue
+
+                # Convert original image to RGB
+                img_rgb_orig = cv2.cvtColor(img_bgr_orig, cv2.COLOR_BGR2RGB)
+
+                # Resize image for MTCNN
+                img_rgb_resized, scale_w, scale_h = resize_image_for_mtcnn(img_rgb_orig, mtcnn_target_size)
+
+                images_orig.append(img_rgb_orig)
+                images_resized.append(img_rgb_resized)
+                scales_w.append(scale_w)
+                scales_h.append(scale_h)
+                valid_indices.append(idx)
+
+            if not images_resized:
+                logger.error("No valid images to process in sub-batch.")
+                continue
+
+            # Detect faces with MTCNN in batch on resized images
+            boxes_batch_resized, probs_batch_resized, landmarks_batch_resized = mtcnn.detect(images_resized, landmarks=True)
+
+            for idx_in_subbatch, idx in enumerate(valid_indices):
+                img_rgb_orig = images_orig[idx_in_subbatch]
+                scale_w = scales_w[idx_in_subbatch]
+                scale_h = scales_h[idx_in_subbatch]
+                image_id = batch_image_ids[idx]
+                filename = batch_filenames[idx]
+                image_url = batch_image_urls[idx]
+
+                boxes_resized = boxes_batch_resized[idx_in_subbatch]
+                landmarks_resized = landmarks_batch_resized[idx_in_subbatch]
+
+                total_images_processed += 1
+
+                if boxes_resized is not None and landmarks_resized is not None:
+                    num_faces = boxes_resized.shape[0]
+                    total_faces += num_faces
+                    images_with_faces += 1
+                    stats_collector.increment_faces_found(num_faces)
+                    stats_collector.increment_images_with_faces()
+
+                    # Adjust boxes and landmarks back to original image coordinates
+                    boxes_orig, landmarks_orig = adjust_boxes_landmarks(boxes_resized, landmarks_resized, scale_w, scale_h)
+
+                    # Convert boxes to integers
+                    boxes_orig = boxes_orig.astype(int)
+
+                    # Get aligned faces for InceptionResnetV1 from original images
+                    aligned_faces = mtcnn.extract(img_rgb_orig, boxes_orig, save_path=None)
+
+                    if aligned_faces is not None and len(aligned_faces) > 0:
+                        # Use aligned_faces directly without stacking
+                        face_tensors = aligned_faces.pin_memory().to(device, non_blocking=True)
+                        # Get embeddings from InceptionResnetV1
+                        with torch.no_grad():
+                            embeddings_facenet = facenet_model(face_tensors).cpu().numpy()
+                        num_embeddings_facenet = embeddings_facenet.shape[0]
+                        logger.debug(f'Number of embeddings from InceptionResnetV1: {num_embeddings_facenet}')
+
+                        # Get embeddings from InsightFace
+                        for i in range(num_faces):
+                            # landmarks_orig[i] has shape (5, 2)
+                            landmark = landmarks_orig[i]
+
+                            # Use face_align.norm_crop to align the face on original image
+                            face_aligned = face_align.norm_crop(img_rgb_orig, landmark=landmark, image_size=112)
+
+                            # Convert the image to BGR
+                            face_aligned_bgr = cv2.cvtColor(face_aligned, cv2.COLOR_RGB2BGR)
+
+                            # Ensure the image is of type uint8
+                            face_aligned_bgr = face_aligned_bgr.astype('uint8')
+
+                            # Get embedding with recognizer
+                            embedding_insight = recognizer.get_feat(face_aligned_bgr)
+
+                            # Collect embeddings_data
+                            embeddings_data.append({
+                                'image_id': image_id,
+                                'filename': filename,
+                                'embedding': embeddings_facenet[i].tolist(),
+                                'insightface_embedding': embedding_insight.tolist()
+                            })
+                    else:
+                        logger.error("Failed to get aligned faces for InceptionResnetV1.")
+                        images_without_faces += 1
+                        stats_collector.increment_images_without_faces()
+                        logger.info(f"No faces detected in image: {filename}")
+
+                        # Write image URL to log file
+                        images_without_faces_log_file.write(f"{image_url}\n")
+                else:
+                    logger.debug(f'MTCNN did not detect faces in image: {filename}')
+                    images_without_faces += 1
+                    stats_collector.increment_images_without_faces()
+                    logger.info(f"No faces detected in image: {filename}")
+
+                    # Write image URL to log file
+                    images_without_faces_log_file.write(f"{image_url}\n")
+
+                # Clear GPU cache every 400 images
+                if total_images_processed % 400 == 0:
+                    torch.cuda.empty_cache()
+                    logger.info("GPU cache cleared.")
+
+        return embeddings_data, total_images_in_batch, total_faces, images_with_faces, images_without_faces
 
     while True:
         batch_info = batch_queue.get()
@@ -86,51 +269,34 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
             continue
 
         embedding_processor_logger.info(f"Starting processing of batch {batch_id}")
-        embeddings_data = []
+
         try:
             image_paths = [os.path.join(batch_dir, filename) for filename in filenames]
             valid_image_ids = []
             valid_filenames = []
             valid_image_urls = []
-            images_data = []
+            valid_image_paths = []
 
+            # Collect valid image data
             for idx, path in enumerate(image_paths):
-                img = cv2.imread(path)
-                if img is not None:
-                    images_data.append(img)
+                if os.path.isfile(path):
+                    valid_image_paths.append(path)
                     valid_image_ids.append(filename_to_id[filenames[idx]])
                     valid_filenames.append(filenames[idx])
                     valid_image_urls.append(filename_to_url[filenames[idx]])
                 else:
-                    embedding_processor_logger.error(f"Failed to load image: {path}")
+                    embedding_processor_logger.error(f"Image file does not exist: {path}")
 
-            total_images = len(images_data)
-            total_faces = 0
-            images_with_faces = 0
-            images_without_faces = 0
+            # Now process images in batch
+            (embeddings_data, total_images_processed_in_batch, total_faces_detected,
+                images_with_faces_count, images_without_faces_count) = process_images_batch(
+                     valid_image_paths, valid_image_ids, valid_filenames, valid_image_urls,
+                     embedding_processor_logger, mtcnn_batch_size)
 
-            for idx_in_batch, img in enumerate(images_data):
-                faces = app.get(img)
-                num_faces = len(faces)
-                total_faces += num_faces
-                if num_faces > 0:
-                    images_with_faces += 1
-                    stats_collector.increment_faces_found(num_faces)
-                    stats_collector.increment_images_with_faces()
-                    for face in faces:
-                        embedding = face.embedding.flatten().tolist()
-                        embeddings_data.append({
-                            'image_id': valid_image_ids[idx_in_batch],
-                            'filename': valid_filenames[idx_in_batch],
-                            'embedding': embedding
-                        })
-                else:
-                    images_without_faces += 1
-                    stats_collector.increment_images_without_faces()
-                    embedding_processor_logger.info(f"No faces detected in image: {valid_filenames[idx_in_batch]}")
-
-                    # Write image URL to log file
-                    images_without_faces_log_file.write(f"{valid_image_urls[idx_in_batch]}\n")
+            total_images = total_images_processed_in_batch
+            total_faces = total_faces_detected
+            images_with_faces = images_with_faces_count
+            images_without_faces = images_without_faces_count
 
             # Pass data for saving to database
             embeddings_queue.put((batch_id, embeddings_data))
@@ -252,20 +418,18 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             # Save embeddings to database in one transaction
             embeddings_objects = []
             for data in embeddings_data:
-                embedding_vector = data['embedding']
+                embedding_vector = data.get('embedding')
+                insightface_embedding_vector = data.get('insightface_embedding')
 
-                if not isinstance(embedding_vector, list):
-                    embeddings_writer_logger.error(f"Embedding is not a list for image_id {data['image_id']}")
-                    continue
-
-                if len(embedding_vector) != 512:
-                    embeddings_writer_logger.error(f"Embedding length is not 512 for image_id {data['image_id']}")
+                if embedding_vector is None and insightface_embedding_vector is None:
+                    embeddings_writer_logger.error(f"No embeddings for image_id {data['image_id']}")
                     continue
 
                 embedding = ImageEmbedding(
                     image_id=data['image_id'],
                     filename=data['filename'],
-                    insightface_embedding=embedding_vector
+                    embedding=embedding_vector,
+                    insightface_embedding=insightface_embedding_vector
                 )
                 embeddings_objects.append(embedding)
             session.bulk_save_objects(embeddings_objects)
@@ -273,7 +437,8 @@ def embeddings_writer_thread(embeddings_queue, db_queue, engine, stats_collector
             embeddings_writer_logger.info(f"Embeddings for batch {batch_id} committed to database.")
 
             # Update statistics
-            stats_collector.increment_embeddings_uploaded(len(embeddings_objects))
+            embeddings_count = len(embeddings_objects)
+            stats_collector.increment_embeddings_uploaded(embeddings_count, embedding_type='both')
 
             # Mark batch as processed
             db_queue.put(('mark_batch_processed', batch_id))
@@ -442,9 +607,9 @@ def main():
                         help='Directory for saving reports (default "reports")')
     parser.add_argument('-si', '--stats-interval', type=int, default=int(os.environ.get('STATS_INTERVAL', 10)),
                         help='Interval in seconds for statistics logging (default 10)')
-    parser.add_argument('--log-level', type=str, default=os.environ.get('LOG_LEVEL', 'INFO'),
+    parser.add_argument('-ll','--log-level', type=str, default=os.environ.get('LOG_LEVEL', 'INFO'),
                         help='Logging level (default INFO)')
-    parser.add_argument('--log-output', type=str, choices=['file', 'console', 'both'],
+    parser.add_argument('-lo', '--log-output', type=str, choices=['file', 'console', 'both'],
                         default=os.environ.get('LOG_OUTPUT', 'file'),
                         help='Logging output: file, console, or both (default file)')
     parser.add_argument('--loggers', type=str, default=os.environ.get('LOGGERS', ''),
@@ -461,7 +626,7 @@ def main():
     parser.add_argument('-q', '--query', type=str, help='Search query string')
 
     # Добавляем аргумент для выбора режима работы
-    parser.add_argument('--mode', type=str, choices=['threaded', 'sequential'], default='threaded',
+    parser.add_argument('-m', '--mode', type=str, choices=['t', 's'], default='threaded',
                         help='Mode of operation: threaded (default) or sequential for debugging.')
 
     args = parser.parse_args()
@@ -548,7 +713,7 @@ def main():
 
     mode = args.mode
 
-    if mode == 'threaded':
+    if mode == 't': # threaded
         # Task queues
         page_queue = Queue()
         batch_queue = Queue()
@@ -776,12 +941,16 @@ def store_batch_in_db(page_number, image_urls, session, log_level, log_output):
         # Добавление изображений
         images_data = []
         image_filenames = []
+        image_paths = []  # Новое
         image_urls_list = []
         for img_url in image_urls:
-            filename = os.path.basename(urlparse(img_url).path)
-            image = Image(base_url_id=base_url.id, filename=filename)
+            parsed_url = urlparse(img_url)
+            filename = os.path.basename(parsed_url.path)
+            path = os.path.dirname(parsed_url.path).lstrip('/')  # Удаляем ведущий '/'
+            image = Image(base_url_id=base_url.id, path=path, filename=filename)
             images_data.append(image)
             image_filenames.append(filename)
+            image_paths.append(path)
             image_urls_list.append(img_url)
 
         if not images_data:
@@ -801,6 +970,7 @@ def store_batch_in_db(page_number, image_urls, session, log_level, log_output):
             'batch_dir': f"batch_{batch.id}",
             'image_ids': [img.id for img in images_data],
             'filenames': image_filenames,
+            'paths': image_paths,  # Добавлено
             'image_urls': image_urls_list,
         }
         db_writer_logger.info(f"Batch {batch.id} is ready.")
@@ -1132,6 +1302,7 @@ def get_facenet_embedding(image, mtcnn, model, device):
 
 # file: db_writer.py
 # directory: .
+
 import os
 import threading
 from urllib.parse import urlparse
@@ -1141,9 +1312,9 @@ from models import HostLog, Checkpoint, BaseImageUrl, Image, Batch, BatchImage, 
 import socket
 import traceback
 import config  # Импортируем модуль конфигурации
+
 def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_level, log_output):
-    # global MACHINE_ID
-    # Set up logger for this function
+    # Set up logger
     log_filename = f'logs/db_writer/db_writer_{config.MACHINE_ID}.log'
     db_writer_logger = configure_thread_logging('db_writer', log_filename, log_level, log_output)
 
@@ -1151,7 +1322,7 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
     session = SessionFactory()
     host_name = socket.gethostname()
 
-    # Check if HostLog exists
+    # Проверка существования HostLog
     existing_host_log = session.query(HostLog).filter_by(host_name=host_name, function_name='db_writer', log_file=log_filename).first()
     if not existing_host_log:
         host_log = HostLog(host_name=host_name, function_name='db_writer', log_file=log_filename)
@@ -1171,7 +1342,7 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
         try:
             if task_type == 'store_batch':
                 page_number, image_urls = data
-                # Handle checkpoint
+                # Обработка чекпоинта
                 page_url = f"http://camvideos.me/?page={page_number}"
                 existing_checkpoint = session.query(Checkpoint).filter_by(page_url=page_url).first()
                 if existing_checkpoint:
@@ -1183,27 +1354,32 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
                 session.add(new_checkpoint)
                 session.commit()
 
-                # Create a new base_url for each batch
+                # Создание base_url
                 base_urls = list(set([f"{urlparse(url).scheme}://{urlparse(url).netloc}" for url in image_urls]))
-                base_url_str = base_urls[0]  # Assuming all images have the same base URL
+                base_url_str = base_urls[0]  # Предполагаем, что все изображения имеют одинаковый base_url
                 base_url = BaseImageUrl(base_url=base_url_str)
                 session.add(base_url)
                 session.commit()
 
-                # Create batch
+                # Создание батча
                 batch = Batch(page_number=page_number)
                 session.add(batch)
                 session.commit()
 
-                # Prepare data for insertion
+                # Подготовка данных для вставки
                 images_data = []
                 image_filenames = []
+                image_paths = []  # Новое
                 image_urls_list = []
+
                 for img_url in image_urls:
-                    filename = os.path.basename(urlparse(img_url).path)
-                    image = Image(base_url_id=base_url.id, filename=filename)
+                    parsed_url = urlparse(img_url)
+                    filename = os.path.basename(parsed_url.path)
+                    path = os.path.dirname(parsed_url.path).lstrip('/')  # Extract the path
+                    image = Image(base_url_id=base_url.id, path=path, filename=filename)
                     images_data.append(image)
                     image_filenames.append(filename)
+                    image_paths.append(path)
                     image_urls_list.append(img_url)
 
                 if not images_data:
@@ -1212,21 +1388,22 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
                     batch_ready_queue.put(None)
                     continue
 
-                # Insert images into the database
+                # Вставка изображений в базу данных
                 session.add_all(images_data)
                 session.commit()
 
-                # Create entries in batch_images
+                # Создание записей в batch_images
                 batch_images_data = [BatchImage(batch_id=batch.id, image_id=img.id) for img in images_data]
                 session.bulk_save_objects(batch_images_data)
                 session.commit()
 
-                # Pass batch information
+                # Передача информации о батче
                 batch_info = {
                     'batch_id': batch.id,
                     'batch_dir': f"batch_{batch.id}",
                     'image_ids': [img.id for img in images_data],
                     'filenames': image_filenames,
+                    'paths': image_paths,  # Новое
                     'image_urls': image_urls_list,
                 }
                 db_queue.task_done()
@@ -1251,7 +1428,7 @@ def db_writer_thread(db_queue, batch_ready_queue, engine, stats_collector, log_l
 
 # file: stats_collector.py
 # directory: .
-
+import json
 import logging
 import os
 import threading
@@ -1267,6 +1444,7 @@ class StatsCollector:
         self.files_downloaded = 0
         self.faces_found = 0
         self.embeddings_uploaded = 0
+        self.embeddings_uploaded_by_type = {'embedding': 0, 'insightface_embedding': 0, 'both': 0}
         self.batch_processing_times = {'downloader': [], 'embedding_processor': [], 'embeddings_writer': [], 'archiver': []}
         self.last_reset_time = time.time()
         # Global stats
@@ -1281,6 +1459,12 @@ class StatsCollector:
         self.batches_processed_by_processor = 0
         self.start_time = time.time()
 
+    def increment_embeddings_uploaded(self, count=1, embedding_type='both'):
+        with self.lock:
+            self.embeddings_uploaded += count
+            self.total_embeddings_uploaded += count
+            self.embeddings_uploaded_by_type[embedding_type] += count
+
     def increment_batches_processed_by_processor(self, count=1):
         with self.lock:
             self.batches_processed_by_processor += count
@@ -1294,11 +1478,6 @@ class StatsCollector:
         with self.lock:
             self.faces_found += count
             self.total_faces_found += count
-
-    def increment_embeddings_uploaded(self, count=1):
-        with self.lock:
-            self.embeddings_uploaded += count
-            self.total_embeddings_uploaded += count
 
     def increment_images_processed(self, count=1):
         with self.lock:
@@ -1331,6 +1510,7 @@ class StatsCollector:
                 'files_downloaded': self.files_downloaded,
                 'faces_found': self.faces_found,
                 'embeddings_uploaded': self.embeddings_uploaded,
+                'embeddings_uploaded_by_type': self.embeddings_uploaded_by_type.copy(),
                 'batch_processing_times': self.batch_processing_times.copy(),
                 'elapsed_time': time.time() - self.last_reset_time,
                 # Global stats
@@ -1349,6 +1529,7 @@ class StatsCollector:
             self.files_downloaded = 0
             self.faces_found = 0
             self.embeddings_uploaded = 0
+            self.embeddings_uploaded_by_type = {'embedding': 0, 'insightface_embedding': 0, 'both': 0}
             self.batch_processing_times = {key: [] for key in self.batch_processing_times}
             self.last_reset_time = time.time()
         return stats
@@ -1415,7 +1596,10 @@ def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_ou
             f"Interval Stats:\n"
             f"  Files Downloaded: {stats['files_downloaded']}\n"
             f"  Faces Found: {stats['faces_found']}\n"
-            f"  Embeddings Uploaded: {stats['embeddings_uploaded']}\n"
+            f"  Embeddings Uploaded by Type:\n"
+            f"    embedding: {stats['embeddings_uploaded_by_type']['embedding']}\n"
+            f"    insightface_embedding: {stats['embeddings_uploaded_by_type']['insightface_embedding']}\n"
+            f"    both: {stats['embeddings_uploaded_by_type']['both']}\n"            
             f"Average Batch Processing Times:\n"
         )
         for thread_name, avg_time in avg_times.items():
@@ -1440,7 +1624,9 @@ def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_ou
 
         stats_logger.info(message)
         print(message)
-
+        # Записываем статистику в файл
+        with open('stats.json', 'w') as f:
+            json.dump(stats, f)
 ----
 
 # file: web_server.py
@@ -1492,6 +1678,7 @@ def start_web_server(page_queue, stats_collector, port, log_level, log_output):
 
 # file: view_web_server.py
 # directory: .
+
 from flask import Flask, request, render_template, redirect
 from werkzeug.utils import secure_filename
 from utils import preprocess_image
@@ -1499,10 +1686,13 @@ import logging
 import os
 import torch
 import numpy as np
+import cv2  # Не забудьте импортировать cv2
 from facenet_pytorch import MTCNN, InceptionResnetV1
+from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 from sqlalchemy.orm import sessionmaker, scoped_session
-from models import ImageEmbedding, Image, BaseImageUrl, ArchivedImage  # Убедитесь, что ArchivedImage импортирован
-from sqlalchemy import create_engine, text, inspect
+from models import ImageEmbedding, Image, BaseImageUrl, ArchivedImage
+from sqlalchemy import create_engine, text
 
 # Настройки приложения
 app = Flask(__name__)
@@ -1517,8 +1707,14 @@ logger = logging.getLogger(__name__)
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Используется устройство: {device}")
 
-mtcnn = MTCNN(keep_all=False, device=device)
-model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+# Инициализируем MTCNN с keep_all=True для обнаружения всех лиц
+mtcnn = MTCNN(keep_all=True, device=device)
+# Инициализируем модель InceptionResnetV1 для получения эмбеддингов FaceNet
+facenet_model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+# Инициализируем модель InsightFace для получения эмбеддингов InsightFace
+app_insight = FaceAnalysis(allowed_modules=['detection', 'recognition'],
+                   providers=['CUDAExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider'])
+app_insight.prepare(ctx_id=0 if device.type == 'cuda' else -1, det_size=(640, 640))
 
 # Подключение к базе данных
 DB_HOST = os.environ.get('DB_HOST', 'localhost')
@@ -1530,9 +1726,6 @@ DATABASE_URL = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}'
 engine = create_engine(DATABASE_URL)
 SessionFactory = sessionmaker(bind=engine)
 Session = scoped_session(SessionFactory)
-
-# Инспектор для проверки наличия таблиц
-inspector = inspect(engine)
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -1554,22 +1747,52 @@ def index():
                     logger.error("Не удалось загрузить изображение.")
                     return render_template('index.html', message="Не удалось загрузить изображение.")
 
-                # Детектирование лица и получение эмбеддинга
-                face = mtcnn(img_rgb)
-                if face is None:
+                # Детектирование лиц и получение координат и ключевых точек с помощью MTCNN
+                boxes, probs, landmarks = mtcnn.detect(img_rgb, landmarks=True)
+                if boxes is None or len(boxes) == 0:
                     logger.info("На загруженном изображении не обнаружено лицо.")
                     return render_template('index.html', message="На загруженном изображении не обнаружено лицо.")
 
-                face = face.unsqueeze(0).to(device)
+                # Используем первое обнаруженное лицо
+                box = boxes[0]
+                landmark = landmarks[0]
+
+                # Преобразуем landmark в numpy-массив с типом float64
+                landmark = np.array(landmark, dtype=np.float64)
+
+                # Извлекаем лицо для InceptionResnetV1
+                face_aligned = mtcnn.extract(img_rgb, [box], save_path=None)
+                if face_aligned is None or len(face_aligned) == 0:
+                    logger.error("Не удалось извлечь лицо.")
+                    return render_template('index.html', message="Не удалось извлечь лицо.")
+
+                face_tensor = face_aligned[0].unsqueeze(0).to(device)
+
                 with torch.no_grad():
-                    embedding = model(face).cpu().numpy()
+                    embedding_facenet = facenet_model(face_tensor).cpu().numpy()
 
-                # Поиск похожих эмбеддингов в базе данных
-                embedding_vector = embedding.flatten().tolist()  # Преобразуем в список чисел
+                # Выравниваем лицо для InsightFace
+                face_aligned_insight = face_align.norm_crop(img_rgb, landmark=landmark, image_size=112)
 
-                # Создаем строковое представление эмбеддинга для использования в SQL
-                embedding_list_str = ','.join(map(str, embedding_vector))
-                embedding_sql = f'ARRAY[{embedding_list_str}]'
+                # Конвертируем в BGR и uint8
+                face_aligned_insight_bgr = cv2.cvtColor(face_aligned_insight, cv2.COLOR_RGB2BGR)
+                face_aligned_insight_bgr = face_aligned_insight_bgr.astype('uint8')
+
+                # Получаем эмбеддинг с помощью InsightFace
+                embedding_insight = app_insight.models['recognition'].get_feat(face_aligned_insight_bgr)
+
+                # Подготавливаем эмбеддинги для SQL-запроса
+                embedding_facenet_vector = embedding_facenet.flatten()
+                embedding_insight_vector = embedding_insight.flatten()
+
+                embedding_facenet_vector_list = embedding_facenet_vector.tolist()
+                embedding_insight_vector_list = embedding_insight_vector.tolist()
+
+                embedding_facenet_list_str = ','.join(map(str, embedding_facenet_vector_list))
+                embedding_facenet_sql = f'ARRAY[{embedding_facenet_list_str}]'
+
+                embedding_insight_list_str = ','.join(map(str, embedding_insight_vector_list))
+                embedding_insight_sql = f'ARRAY[{embedding_insight_list_str}]'
 
                 with Session() as session:
                     # Проверяем, есть ли эмбеддинги в базе данных
@@ -1578,95 +1801,71 @@ def index():
                         logger.info("В базе данных нет эмбеддингов.")
                         return render_template('index.html', message="В базе данных нет эмбеддингов.")
 
-                    # Выполняем обновленный SQL-запрос
-                    sql_query = f"""
-                        WITH ranked_embeddings AS (
-                            SELECT
-                                image_id,
-                                filename,
-                                embedding,
-                                embedding <=> {embedding_sql}::vector AS distance,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY image_id
-                                    ORDER BY embedding <=> {embedding_sql}::vector
-                                ) AS rn
-                            FROM
-                                image_embeddings
-                        )
+                # Выполняем SQL-запрос, используя оба эмбеддинга и усредняя расстояния
+                sql_query = f"""
+                    WITH distances AS (
                         SELECT
-                            image_id,
-                            filename
+                            ie.image_id,
+                            ie.filename,
+                            COALESCE((ie.embedding <=> {embedding_facenet_sql}::vector), 2.0) AS facenet_distance,
+                            COALESCE((ie.insightface_embedding <=> {embedding_insight_sql}::vector), 2.0) AS insightface_distance,
+                            ((COALESCE((ie.embedding <=> {embedding_facenet_sql}::vector), 2.0) + COALESCE((ie.insightface_embedding <=> {embedding_insight_sql}::vector), 2.0)) / 2) AS avg_distance
                         FROM
-                            ranked_embeddings
-                        WHERE
-                            rn = 1
-                        ORDER BY
-                            distance
-                        LIMIT 10;
-                    """
+                            image_embeddings ie
+                    )
+                    SELECT
+                        d.image_id,
+                        d.filename,
+                        i.path,  -- Добавлено
+                        d.facenet_distance,
+                        d.insightface_distance,
+                        d.avg_distance,
+                        ai.archive_url,
+                        biu.base_url
+                    FROM
+                        distances d
+                    LEFT JOIN images i ON d.image_id = i.id
+                    LEFT JOIN base_image_urls biu ON i.base_url_id = biu.id
+                    LEFT JOIN archived_images ai ON d.image_id = ai.image_id
+                    ORDER BY
+                        d.avg_distance
+                    LIMIT 10;
+                """
 
-                    results = session.execute(text(sql_query)).mappings().all()
+                results = session.execute(text(sql_query)).mappings().all()
 
-                    # Получение URL изображений
-                    similar_images = []
-                    for row in results:
-                        image_id = row['image_id']
-                        filename = row['filename']
+                # Получение URL изображений
+                similar_images = []
+                for row in results:
+                    image_id = row['image_id']
+                    filename = row['filename']
+                    path = row['path']  # Добавлено
+                    archive_url = row['archive_url']
+                    base_url = row['base_url']
+                    facenet_distance = row['facenet_distance']
+                    insightface_distance = row['insightface_distance']
+                    avg_distance = row['avg_distance']
 
-                        # Проверяем наличие таблицы ArchivedImage
-                        if 'archived_images' in inspector.get_table_names():
-                            # Попробуем получить архивированное изображение
-                            try:
-                                archived_image = session.query(ArchivedImage).filter_by(image_id=image_id).first()
-                                if archived_image:
-                                    image_url = archived_image.archive_url
-                                else:
-                                    # Используем оригинальный URL
-                                    image = session.query(Image).filter_by(id=image_id).first()
-                                    if image is None:
-                                        logger.error(f"Изображение с id {image_id} не найдено.")
-                                        continue
-
-                                    base_image_url = session.query(BaseImageUrl).filter_by(id=image.base_url_id).first()
-                                    if base_image_url is None:
-                                        logger.error(f"Базовый URL с id {image.base_url_id} не найден.")
-                                        continue
-
-                                    base_url = base_image_url.base_url
-                                    image_url = f"{base_url}/{filename}"
-                            except Exception as e:
-                                logger.error(f"Ошибка при обращении к таблице archived_images: {e}")
-                                # Используем оригинальный URL
-                                image = session.query(Image).filter_by(id=image_id).first()
-                                if image is None:
-                                    logger.error(f"Изображение с id {image_id} не найдено.")
-                                    continue
-
-                                base_image_url = session.query(BaseImageUrl).filter_by(id=image.base_url_id).first()
-                                if base_image_url is None:
-                                    logger.error(f"Базовый URL с id {image.base_url_id} не найден.")
-                                    continue
-
-                                base_url = base_image_url.base_url
-                                image_url = f"{base_url}/{filename}"
+                    # Предпочитаем archive_url, если он есть
+                    if archive_url:
+                        image_url = archive_url
+                    elif base_url:
+                        if path:
+                            image_url = f"{base_url}/{path}/{filename}"
                         else:
-                            # Таблица archived_images не существует, используем оригинальный URL
-                            image = session.query(Image).filter_by(id=image_id).first()
-                            if image is None:
-                                logger.error(f"Изображение с id {image_id} не найдено.")
-                                continue
-
-                            base_image_url = session.query(BaseImageUrl).filter_by(id=image.base_url_id).first()
-                            if base_image_url is None:
-                                logger.error(f"Базовый URL с id {image.base_url_id} не найден.")
-                                continue
-
-                            base_url = base_image_url.base_url
                             image_url = f"{base_url}/{filename}"
+                    else:
+                        logger.error(f"Не удалось получить URL для изображения с id {image_id}.")
+                        continue
 
-                        similar_images.append(image_url)
+                    similar_images.append({
+                        'image_url': image_url,
+                        'facenet_distance': facenet_distance,
+                        'insightface_distance': insightface_distance,
+                        'avg_distance': avg_distance
+                    })
 
-                # Возвращаем результат после цикла
+                # Возвращаем результат
                 return render_template('results.html', images=similar_images)
             except Exception as e:
                 logger.error(f"Ошибка при обработке загруженного изображения: {e}", exc_info=True)
@@ -1674,14 +1873,18 @@ def index():
     return render_template('index.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8070, debug=True)
+    # Запуск приложения без перезагрузчика
+    app.run(host='0.0.0.0', port=8070, debug=True, use_reloader=False)
 
 ----
 
+# file: downloader.py
+# directory: .
 import os
 import threading
 import time
 import requests
+import shutil
 from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.parse import urlparse
 
@@ -1710,18 +1913,26 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
             page_queue.task_done()
             break  # Termination signal
 
-        start_time = time.time()
-        page_number = page_info['page_number']
-        search_query = page_info.get('query')
+        try:
+            start_time = time.time()
+            page_number = page_info['page_number']
+            search_query = page_info.get('query')
 
-        if search_query:
-            page_url = f"http://camvideos.me/search/{search_query}?page={page_number}"
-        else:
-            page_url = f"http://camvideos.me/?page={page_number}"
+            if search_query:
+                page_url = f"http://camvideos.me/search/{search_query}?page={page_number}"
+            else:
+                page_url = f"http://camvideos.me/?page={page_number}"
 
-        image_urls = process_page(page_url, stats_collector, log_level, log_output)
+            image_urls = process_page(page_url, stats_collector, log_level, log_output)
 
-        if image_urls:
+            if not image_urls:
+                downloader_logger.info(f"No images on page {page_url}")
+                page_queue.task_done()
+                continue
+
+            # **Отправляем задачу на запись батча в базу данных**
+            db_queue.put(('store_batch', (page_number, image_urls)))
+
             # Wait until current_batches_on_disk < MAX_BATCHES_ON_DISK
             with condition:
                 while config.current_batches_on_disk >= MAX_BATCHES_ON_DISK:
@@ -1745,17 +1956,23 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
 
             if archive_enabled:
                 # Получаем все ArchivedImage для текущего батча по именам файлов одним запросом
-                archived_images = session.query(ArchivedImage).filter(ArchivedImage.filename.in_(filenames)).all()
-                archived_filenames = {img.filename for img in archived_images}
+                try:
+                    archived_images = session.query(ArchivedImage).filter(ArchivedImage.filename.in_(filenames)).all()
+                    archived_filenames = {img.filename for img in archived_images}
+                    filename_to_archive_url = {img.filename: img.archive_url for img in archived_images}
+                except Exception as e:
+                    downloader_logger.error(f"Database error while querying ArchivedImage: {e}")
+                    archived_filenames = set()
+                    filename_to_archive_url = {}
             else:
                 archived_filenames = set()
+                filename_to_archive_url = {}
 
             images_to_download = []
             for filename in filenames:
                 if archive_enabled and filename in archived_filenames:
                     # Изображение есть в архиве
-                    archived_image = next(img for img in archived_images if img.filename == filename)
-                    archive_url = archived_image.archive_url
+                    archive_url = filename_to_archive_url[filename]
                     local_path = os.path.join(batch_dir, filename)
                     success = download_image(archive_url, local_path, downloader_logger, stats_collector)
                     if not success:
@@ -1785,31 +2002,38 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                         failed_downloads.append(future)
 
                 if failed_downloads:
-                    downloader_logger.warning(f"Batch {page_number} has failed downloads.")
+                    downloader_logger.warning(f"Batch for page {page_number} has failed downloads.")
                     # Решаем, что делать с неудачными загрузками
+                    # Например, можно удалить батч и пропустить его
+                    # Или продолжить обработку с имеющимися файлами
                 else:
-                    downloader_logger.info(f"All images for batch {page_number} downloaded successfully.")
+                    downloader_logger.info(f"All images for batch from page {page_number} downloaded successfully.")
 
             else:
-                downloader_logger.info(f"All images for batch {page_number} were downloaded from archive.")
+                downloader_logger.info(f"All images for batch from page {page_number} were downloaded from archive.")
 
-            # **Теперь отправляем задачу на запись батча в базу данных и ждём её завершения перед передачей батча процессору**
-            db_queue.put(('store_batch', (page_number, image_urls)))
-
-            # Ждём, пока батч будет готов
+            # **Ждём, пока батч будет записан в базу данных**
             batch_info = batch_ready_queue.get()
             if batch_info is None:
                 batch_ready_queue.task_done()
-                downloader_logger.info(f"Batch for page {page_url} was not created.")
+                downloader_logger.error(f"Failed to create batch for page {page_url}.")
+                # Удаляем загруженные файлы и директорию
+                shutil.rmtree(batch_dir, ignore_errors=True)
+                # Уменьшаем счетчик текущих батчей на диске
+                with condition:
+                    config.current_batches_on_disk -= 1
+                    condition.notify()
                 page_queue.task_done()
                 continue
 
             batch_id = batch_info['batch_id']
+            image_ids = batch_info['image_ids']
             # Обновляем batch_info с актуальной информацией
             batch_info.update({
                 'batch_dir': batch_dir,
                 'filenames': filenames,
                 'image_urls': image_urls,
+                'paths': batch_info['paths'],  # Ensure 'paths' are included
             })
 
             # Теперь, когда батч готов и все изображения загружены, добавляем его в очередь на обработку
@@ -1818,12 +2042,19 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
 
             batch_ready_queue.task_done()
 
-        else:
-            downloader_logger.info(f"No images on page {page_url}")
-
-        processing_time = time.time() - start_time
-        stats_collector.add_batch_processing_time('downloader', processing_time)
-        page_queue.task_done()
+        except Exception as e:
+            downloader_logger.error(f"Error processing page {page_number}: {e}", exc_info=True)
+            # Удаляем загруженные файлы и директорию в случае ошибки
+            if 'batch_dir' in locals():
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            # Уменьшаем счетчик текущих батчей на диске
+            with condition:
+                config.current_batches_on_disk -= 1
+                condition.notify()
+        finally:
+            processing_time = time.time() - start_time
+            stats_collector.add_batch_processing_time('downloader', processing_time)
+            page_queue.task_done()
 
     # Ожидаем завершения всех задач перед завершением
     executor.shutdown(wait=True)
@@ -1839,18 +2070,22 @@ def process_page(page_url, stats_collector, log_level, log_output):
     try:
         response = requests.get(page_url, timeout=10)
         response.raise_for_status()
-    except Exception as e:
+    except requests.RequestException as e:
         html_logger.error(f"Error loading page {page_url}: {e}")
         return []
 
-    soup = BeautifulSoup(response.text, 'html.parser')
+    try:
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Extract image URLs
-    posts = soup.find_all('div', class_='post-container')
-    image_urls = [post.find('img')['src'].replace('.th', '') for post in posts if post.find('img')]
+        # Extract image URLs
+        posts = soup.find_all('div', class_='post-container')
+        image_urls = [post.find('img')['src'].replace('.th', '') for post in posts if post.find('img')]
 
-    html_logger.info(f"Found {len(image_urls)} images on page {page_url}")
-    return image_urls
+        html_logger.info(f"Found {len(image_urls)} images on page {page_url}")
+        return image_urls
+    except Exception as e:
+        html_logger.error(f"Error parsing page {page_url}: {e}", exc_info=True)
+        return []
 
 
 def get_total_pages_for_query(query):
@@ -1858,29 +2093,33 @@ def get_total_pages_for_query(query):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"Error loading page {url}: {e}")
         return 0
 
-    soup = BeautifulSoup(response.text, 'html.parser')
+    try:
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Ищем элемент с классом 'numberofpages'
-    numberofpages_element = soup.find('a', class_='numberofpages')
-    if numberofpages_element:
-        total_pages_text = numberofpages_element.text.strip('..')
-        try:
-            total_pages = int(total_pages_text)
-            return total_pages
-        except ValueError:
-            print(f"Could not parse total pages from text: {total_pages_text}")
-            return 1
-    else:
-        # Если элемент не найден, проверяем наличие постов
-        posts = soup.find_all('div', class_='post-container')
-        if posts:
-            return 1
+        # Ищем элемент с классом 'numberofpages'
+        numberofpages_element = soup.find('a', class_='numberofpages')
+        if numberofpages_element:
+            total_pages_text = numberofpages_element.text.strip('..')
+            try:
+                total_pages = int(total_pages_text)
+                return total_pages
+            except ValueError:
+                print(f"Could not parse total pages from text: {total_pages_text}")
+                return 1
         else:
-            return 0
+            # Если элемент не найден, проверяем наличие постов
+            posts = soup.find_all('div', class_='post-container')
+            if posts:
+                return 1
+            else:
+                return 0
+    except Exception as e:
+        print(f"Error parsing page {url}: {e}")
+        return 0
 
 
 def download_image(image_url, local_path, downloader_logger, stats_collector):
@@ -1892,8 +2131,11 @@ def download_image(image_url, local_path, downloader_logger, stats_collector):
         downloader_logger.info(f"Downloaded image: {image_url}")
         stats_collector.increment_files_downloaded()
         return True
-    except Exception as e:
+    except requests.RequestException as e:
         downloader_logger.error(f"Error downloading {image_url}: {e}")
+        return False
+    except IOError as e:
+        downloader_logger.error(f"Error saving image {image_url} to {local_path}: {e}")
         return False
 
 ----
@@ -1917,7 +2159,6 @@ from pgvector.sqlalchemy import Vector
 
 Base = declarative_base()
 
-# ORM models with indexes defined
 class BaseImageUrl(Base):
     __tablename__ = 'base_image_urls'
     id = Column(Integer, primary_key=True)
@@ -1933,6 +2174,7 @@ class Image(Base):
     __tablename__ = 'images'
     id = Column(Integer, primary_key=True)
     base_url_id = Column(Integer, ForeignKey('base_image_urls.id'), nullable=False)
+    path = Column(String, nullable=False)  # Поле path должно быть не NULL
     filename = Column(String, nullable=False)
     processed = Column(Boolean, default=False)
     base_image_url = relationship("BaseImageUrl", back_populates="images")
@@ -1940,12 +2182,12 @@ class Image(Base):
     archived_image = relationship("ArchivedImage", back_populates="image", uselist=False)
 
     __table_args__ = (
-        UniqueConstraint('base_url_id', 'filename', name='_base_image_uc'),
+        UniqueConstraint('base_url_id', 'path', 'filename', name='_base_image_uc'),
         Index('idx_images_base_url_id', 'base_url_id'),
         Index('idx_images_processed', 'processed'),
         Index('idx_images_filename', 'filename'),
+        Index('idx_images_path', 'path'),
     )
-
 
 class Batch(Base):
     __tablename__ = 'batches'
@@ -2045,10 +2287,10 @@ class BatchLog(Base):
     )
 
 
-# New model for archived images
 class ArchivedImage(Base):
     __tablename__ = 'archived_images'
     id = Column(Integer, primary_key=True)
+    image_id = Column(Integer, ForeignKey('images.id'), nullable=False)  # Добавлено поле внешнего ключа
     filename = Column(String, index=True)
     archive_url = Column(String)
     image = relationship("Image", back_populates="archived_image")

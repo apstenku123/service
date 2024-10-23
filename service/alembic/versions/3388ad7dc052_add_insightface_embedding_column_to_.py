@@ -1,3 +1,5 @@
+# file: 3388ad7dc052_add_insightface_embedding_column_to_.py
+# directory: alembic/versions
 """Add insightface_embedding column to image_embeddings
 
 Revision ID: 3388ad7dc052

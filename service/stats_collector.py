@@ -1,6 +1,6 @@
 # file: stats_collector.py
 # directory: .
-
+import json
 import logging
 import os
 import threading
@@ -16,6 +16,7 @@ class StatsCollector:
         self.files_downloaded = 0
         self.faces_found = 0
         self.embeddings_uploaded = 0
+        self.embeddings_uploaded_by_type = {'embedding': 0, 'insightface_embedding': 0, 'both': 0}
         self.batch_processing_times = {'downloader': [], 'embedding_processor': [], 'embeddings_writer': [], 'archiver': []}
         self.last_reset_time = time.time()
         # Global stats
@@ -30,6 +31,12 @@ class StatsCollector:
         self.batches_processed_by_processor = 0
         self.start_time = time.time()
 
+    def increment_embeddings_uploaded(self, count=1, embedding_type='both'):
+        with self.lock:
+            self.embeddings_uploaded += count
+            self.total_embeddings_uploaded += count
+            self.embeddings_uploaded_by_type[embedding_type] += count
+
     def increment_batches_processed_by_processor(self, count=1):
         with self.lock:
             self.batches_processed_by_processor += count
@@ -43,11 +50,6 @@ class StatsCollector:
         with self.lock:
             self.faces_found += count
             self.total_faces_found += count
-
-    def increment_embeddings_uploaded(self, count=1):
-        with self.lock:
-            self.embeddings_uploaded += count
-            self.total_embeddings_uploaded += count
 
     def increment_images_processed(self, count=1):
         with self.lock:
@@ -80,6 +82,7 @@ class StatsCollector:
                 'files_downloaded': self.files_downloaded,
                 'faces_found': self.faces_found,
                 'embeddings_uploaded': self.embeddings_uploaded,
+                'embeddings_uploaded_by_type': self.embeddings_uploaded_by_type.copy(),
                 'batch_processing_times': self.batch_processing_times.copy(),
                 'elapsed_time': time.time() - self.last_reset_time,
                 # Global stats
@@ -98,6 +101,7 @@ class StatsCollector:
             self.files_downloaded = 0
             self.faces_found = 0
             self.embeddings_uploaded = 0
+            self.embeddings_uploaded_by_type = {'embedding': 0, 'insightface_embedding': 0, 'both': 0}
             self.batch_processing_times = {key: [] for key in self.batch_processing_times}
             self.last_reset_time = time.time()
         return stats
@@ -164,7 +168,10 @@ def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_ou
             f"Interval Stats:\n"
             f"  Files Downloaded: {stats['files_downloaded']}\n"
             f"  Faces Found: {stats['faces_found']}\n"
-            f"  Embeddings Uploaded: {stats['embeddings_uploaded']}\n"
+            f"  Embeddings Uploaded by Type:\n"
+            f"    embedding: {stats['embeddings_uploaded_by_type']['embedding']}\n"
+            f"    insightface_embedding: {stats['embeddings_uploaded_by_type']['insightface_embedding']}\n"
+            f"    both: {stats['embeddings_uploaded_by_type']['both']}\n"            
             f"Average Batch Processing Times:\n"
         )
         for thread_name, avg_time in avg_times.items():
@@ -189,3 +196,6 @@ def stats_logger_thread(stats_collector, interval, stop_event, log_level, log_ou
 
         stats_logger.info(message)
         print(message)
+        # Записываем статистику в файл
+        with open('stats.json', 'w') as f:
+            json.dump(stats, f)

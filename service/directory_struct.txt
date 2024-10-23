@@ -13,6 +13,24 @@ service/
     view_web_server.py
     downloader.py
     models.py
+    intermediate_manager.py
+    archiver_functions.py
+test_nv/
+    test22.py
+    test44.py
+    test_embedding_dual.py
+    test55.py
+    test88.py
+    ocv.py
+    check_cv_cuda.py
+    test444.py
+    test_face_embedding.py
+    test66.py
+    test77.py
+    test445.py
+    test33.py
+al/
+    env.py
 tests/
     test_processor/
         test_processor.py
@@ -42,16 +60,22 @@ tests/
         input_data/
         output_data/
         logs/
+alembic/
+    env.py
+    versions/
+        3388ad7dc052_add_insightface_embedding_column_to_.py
+azure/
+    manager.py
+    templates/
+        index.html
+        instance_detail.html
 reports/
 uploads/
 templates/
     index.html
+    parser_status.html
     results.html
 downloads/
 logs/
     html_processor/
-    embeddings_writer/
-    embedding_processor/
-    db_writer/
-    downloader/
     main/

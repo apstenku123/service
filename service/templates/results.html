@@ -34,9 +34,9 @@
     <div class="container results-container">
         <h1 class="text-center">Similar Images</h1>
         <div class="image-grid">
-            {% for image_url in images %}
+            {% for image in images %}
             <div class="image-grid-item">
-                <img src="{{ image_url }}" alt="Similar Image">
+                <img src="{{ image['image_url'] }}" alt="Similar Image">
             </div>
             {% endfor %}
         </div>

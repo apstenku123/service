@@ -43,9 +43,9 @@ def main():
                         help='Directory for saving reports (default "reports")')
     parser.add_argument('-si', '--stats-interval', type=int, default=int(os.environ.get('STATS_INTERVAL', 10)),
                         help='Interval in seconds for statistics logging (default 10)')
-    parser.add_argument('--log-level', type=str, default=os.environ.get('LOG_LEVEL', 'INFO'),
+    parser.add_argument('-ll','--log-level', type=str, default=os.environ.get('LOG_LEVEL', 'INFO'),
                         help='Logging level (default INFO)')
-    parser.add_argument('--log-output', type=str, choices=['file', 'console', 'both'],
+    parser.add_argument('-lo', '--log-output', type=str, choices=['file', 'console', 'both'],
                         default=os.environ.get('LOG_OUTPUT', 'file'),
                         help='Logging output: file, console, or both (default file)')
     parser.add_argument('--loggers', type=str, default=os.environ.get('LOGGERS', ''),
@@ -62,7 +62,7 @@ def main():
     parser.add_argument('-q', '--query', type=str, help='Search query string')
 
     # Добавляем аргумент для выбора режима работы
-    parser.add_argument('--mode', type=str, choices=['threaded', 'sequential'], default='threaded',
+    parser.add_argument('-m', '--mode', type=str, choices=['t', 's'], default='threaded',
                         help='Mode of operation: threaded (default) or sequential for debugging.')
 
     args = parser.parse_args()
@@ -149,7 +149,7 @@ def main():
 
     mode = args.mode
 
-    if mode == 'threaded':
+    if mode == 't': # threaded
         # Task queues
         page_queue = Queue()
         batch_queue = Queue()
@@ -377,12 +377,16 @@ def store_batch_in_db(page_number, image_urls, session, log_level, log_output):
         # Добавление изображений
         images_data = []
         image_filenames = []
+        image_paths = []  # Новое
         image_urls_list = []
         for img_url in image_urls:
-            filename = os.path.basename(urlparse(img_url).path)
-            image = Image(base_url_id=base_url.id, filename=filename)
+            parsed_url = urlparse(img_url)
+            filename = os.path.basename(parsed_url.path)
+            path = os.path.dirname(parsed_url.path).lstrip('/')  # Удаляем ведущий '/'
+            image = Image(base_url_id=base_url.id, path=path, filename=filename)
             images_data.append(image)
             image_filenames.append(filename)
+            image_paths.append(path)
             image_urls_list.append(img_url)
 
         if not images_data:
@@ -402,6 +406,7 @@ def store_batch_in_db(page_number, image_urls, session, log_level, log_output):
             'batch_dir': f"batch_{batch.id}",
             'image_ids': [img.id for img in images_data],
             'filenames': image_filenames,
+            'paths': image_paths,  # Добавлено
             'image_urls': image_urls_list,
         }
         db_writer_logger.info(f"Batch {batch.id} is ready.")
