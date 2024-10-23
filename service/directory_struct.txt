@@ -68,6 +68,7 @@ azure/
     manager.py
     templates/
         index.html
+        logs.html
         instance_detail.html
 reports/
 uploads/
@@ -76,6 +77,7 @@ templates/
     parser_status.html
     results.html
 downloads/
+favicon/
 logs/
     html_processor/
     main/

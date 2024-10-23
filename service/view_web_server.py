@@ -1,3 +1,5 @@
+# file: view_web_server.py
+# directory: .
 from flask import Flask, request, render_template, redirect
 from werkzeug.utils import secure_filename
 from PIL import Image as PILImage, UnidentifiedImageError

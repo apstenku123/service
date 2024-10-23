@@ -135,14 +135,20 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                 wait(futures)
 
                 # Check download results
+                # Check download results
                 for future in futures:
-                    result = future.result()
-                    if not result:
+                    try:
+                        result = future.result()
+                        if not result:
+                            failed_downloads.append(future.filename)
+                    except Exception as e:
+                        downloader_logger.info(f"Exception raised during downloading {future.filename}: {e}",
+                                                exc_info=True)
                         failed_downloads.append(future.filename)
 
             # Handle failed downloads
             if failed_downloads:
-                downloader_logger.warning(f"Failed to download images: {failed_downloads}")
+                downloader_logger.info(f"Failed to download images: {failed_downloads}")
                 # Remove image records from database for failed downloads
                 try:
                     # Remove from BatchImage
@@ -188,12 +194,16 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                 batch_queue.task_done()
                 page_queue.task_done()
                 continue
-            else:
-                # Update batch_info to reflect remaining images
+            else:    # Update batch_info to reflect remaining images
                 batch_info['filenames'] = remaining_images
                 batch_info['image_ids'] = [filename_to_id[fn] for fn in remaining_images]
                 batch_info['image_urls'] = [filename_to_url[fn] for fn in remaining_images]
                 batch_info['paths'] = [batch_info['paths'][filenames.index(fn)] for fn in remaining_images]
+
+                # **Rebuild filename_to_id and filename_to_url mappings**
+                filename_to_id = {fn: filename_to_id[fn] for fn in remaining_images}
+                filename_to_url = {fn: filename_to_url[fn] for fn in remaining_images}
+
                 # Now, when batch is ready and all images are downloaded, add it to processing queue
                 batch_queue.put(batch_info)
                 downloader_logger.info(f"Batch {batch_id} added to processing queue.")
@@ -290,7 +300,7 @@ def download_image(image_url, local_path, downloader_logger, stats_collector):
         stats_collector.increment_files_downloaded()
         return True
     except requests.RequestException as e:
-        downloader_logger.error(f"Error downloading {image_url}: {e}")
+        downloader_logger.info(f"Error downloading {image_url}: {e}")
         return False
     except IOError as e:
         downloader_logger.error(f"Error saving image {image_url} to {local_path}: {e}")

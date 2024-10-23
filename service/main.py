@@ -62,7 +62,7 @@ def main():
     parser.add_argument('-q', '--query', type=str, help='Search query string')
 
     # Добавляем аргумент для выбора режима работы
-    parser.add_argument('-m', '--mode', type=str, choices=['t', 's'], default='threaded',
+    parser.add_argument('-m', '--mode', type=str, choices=['t', 's'], default='t',
                         help='Mode of operation: threaded (default) or sequential for debugging.')
 
     args = parser.parse_args()
@@ -302,11 +302,21 @@ def run_sequential(args, total_pages_to_process, DOWNLOAD_DIR, DOWNLOAD_THREADS,
             config.current_batches_on_disk += 1  # Увеличиваем счетчик
 
         try:
-            # 3. Загрузка изображений
-            batch_info = download_batch_images(batch_info, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector, LOG_LEVEL, LOG_OUTPUT, archive_enabled, session)
+            # Inside the main loop in main()
+            batch_info = download_batch_images(
+                batch_info, DOWNLOAD_DIR, DOWNLOAD_THREADS, stats_collector, LOG_LEVEL, LOG_OUTPUT, archive_enabled,
+                session
+            )
 
-            # 4. Обработка эмбеддингов
-            embeddings_data = process_embeddings(batch_info, app, device, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file, session)
+            # Check if batch_info is None (no images to process)
+            if not batch_info:
+                logger.info(f"No images left in batch after removing failed downloads. Skipping batch.")
+                continue  # Skip to the next page
+
+            # Proceed with processing embeddings
+            embeddings_data = process_embeddings(
+                batch_info, app, device, stats_collector, LOG_LEVEL, LOG_OUTPUT, images_without_faces_log_file, session
+            )
 
             # 5. Сохранение эмбеддингов в базу данных
             save_embeddings_to_db(batch_info['batch_id'], embeddings_data, session, stats_collector, LOG_LEVEL, LOG_OUTPUT)
@@ -432,6 +442,8 @@ def download_batch_images(batch_info, download_dir, download_threads, stats_coll
     id_to_url = dict(zip(image_ids, image_urls))
 
     images_to_download = []
+    failed_downloads = []
+
     for img_id in image_ids:
         archived_image = session.query(ArchivedImage).filter_by(image_id=img_id).first()
         if archived_image and archive_enabled:
@@ -451,6 +463,48 @@ def download_batch_images(batch_info, download_dir, download_threads, stats_coll
             success = download_image(img_url, local_path, downloader_logger, stats_collector)
             if not success:
                 downloader_logger.error(f"Failed to download image {img_url}")
+                failed_downloads.append(img_id)
+
+    # Handle failed downloads
+    if failed_downloads:
+        downloader_logger.warning(f"Failed to download images: {[id_to_url[id] for id in failed_downloads]}")
+        # Remove image records from database for failed downloads
+        try:
+            # Remove from BatchImage
+            session.query(BatchImage).filter(
+                BatchImage.batch_id == batch_id,
+                BatchImage.image_id.in_(failed_downloads)
+            ).delete(synchronize_session=False)
+            # Remove from Image
+            session.query(Image).filter(Image.id.in_(failed_downloads)).delete(synchronize_session=False)
+            session.commit()
+            downloader_logger.info(f"Removed failed images from database.")
+        except Exception as e:
+            session.rollback()
+            downloader_logger.error(f"Error removing failed images from database: {e}", exc_info=True)
+
+    # Update batch_info to exclude failed downloads
+    remaining_image_ids = [img_id for img_id in image_ids if img_id not in failed_downloads]
+    if not remaining_image_ids:
+        downloader_logger.warning(f"No images left in batch {batch_id} after removing failed downloads.")
+        # Remove batch from database
+        try:
+            session.query(BatchImage).filter(BatchImage.batch_id == batch_id).delete(synchronize_session=False)
+            session.query(Batch).filter(Batch.id == batch_id).delete(synchronize_session=False)
+            session.commit()
+            downloader_logger.info(f"Removed batch {batch_id} from database.")
+        except Exception as e:
+            session.rollback()
+            downloader_logger.error(f"Error removing batch {batch_id} from database: {e}", exc_info=True)
+        # Delete batch directory
+        shutil.rmtree(batch_dir, ignore_errors=True)
+        return None  # Indicate that the batch has no images to process
+    else:
+        # Update batch_info
+        batch_info['image_ids'] = remaining_image_ids
+        batch_info['filenames'] = [id_to_filename[img_id] for img_id in remaining_image_ids]
+        batch_info['image_urls'] = [id_to_url[img_id] for img_id in remaining_image_ids]
+        batch_info['paths'] = [batch_info['paths'][image_ids.index(img_id)] for img_id in remaining_image_ids]
 
     batch_info['batch_dir'] = batch_dir
     return batch_info
