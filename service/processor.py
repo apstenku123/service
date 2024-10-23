@@ -89,6 +89,16 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
 
         return boxes, landmarks
 
+    # Function to check if image is a valid JPEG
+    def is_valid_jpeg(image_path):
+        # Check if file is a valid JPEG
+        try:
+            with open(image_path, 'rb') as f:
+                f.seek(-2, 2)
+                return f.read() == b'\xff\xd9'
+        except Exception as e:
+            return False
+
     # Function to process images in batch
     def process_images_batch(image_paths, valid_image_ids, valid_filenames, valid_image_urls, logger, mtcnn_batch_size):
         embeddings_data = []
@@ -116,8 +126,39 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
 
             for idx, image_path in enumerate(batch_image_paths):
                 img_bgr_orig = cv2.imread(image_path)
+                image_id = batch_image_ids[idx]
+                filename = batch_filenames[idx]
+                image_url = batch_image_urls[idx]
+
                 if img_bgr_orig is None:
-                    logger.error(f"Failed to load image: {image_path}")
+                    logger.warning(f"Failed to load image: {image_path}. Removing from database.")
+                    # Remove image record from database
+                    try:
+                        # Remove from BatchImage
+                        session.query(BatchImage).filter(BatchImage.image_id == image_id).delete(synchronize_session=False)
+                        # Remove from Image
+                        session.query(Image).filter(Image.id == image_id).delete(synchronize_session=False)
+                        session.commit()
+                        logger.info(f"Removed image_id {image_id} from database.")
+                    except Exception as e:
+                        session.rollback()
+                        logger.error(f"Error removing image_id {image_id} from database: {e}", exc_info=True)
+                    continue
+
+                # Check if image is valid JPEG
+                if not is_valid_jpeg(image_path):
+                    logger.warning(f"Image is not a valid JPEG: {image_path}. Removing from database.")
+                    # Remove image record from database
+                    try:
+                        # Remove from BatchImage
+                        session.query(BatchImage).filter(BatchImage.image_id == image_id).delete(synchronize_session=False)
+                        # Remove from Image
+                        session.query(Image).filter(Image.id == image_id).delete(synchronize_session=False)
+                        session.commit()
+                        logger.info(f"Removed image_id {image_id} from database.")
+                    except Exception as e:
+                        session.rollback()
+                        logger.error(f"Error removing image_id {image_id} from database: {e}", exc_info=True)
                     continue
 
                 # Convert original image to RGB
@@ -264,7 +305,41 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
                     valid_filenames.append(filenames[idx])
                     valid_image_urls.append(filename_to_url[filenames[idx]])
                 else:
-                    embedding_processor_logger.error(f"Image file does not exist: {path}")
+                    embedding_processor_logger.warning(f"Image file does not exist: {path}. Removing from database.")
+                    # Remove image record from database
+                    image_id = filename_to_id[filenames[idx]]
+                    try:
+                        # Remove from BatchImage
+                        session.query(BatchImage).filter(BatchImage.image_id == image_id).delete(synchronize_session=False)
+                        # Remove from Image
+                        session.query(Image).filter(Image.id == image_id).delete(synchronize_session=False)
+                        session.commit()
+                        embedding_processor_logger.info(f"Removed image_id {image_id} from database.")
+                    except Exception as e:
+                        session.rollback()
+                        embedding_processor_logger.error(f"Error removing image_id {image_id} from database: {e}", exc_info=True)
+
+            if not valid_image_ids:
+                embedding_processor_logger.warning(f"No valid images to process for batch {batch_id}. Removing batch from database.")
+                # Remove batch from database
+                try:
+                    # Remove from BatchImage
+                    session.query(BatchImage).filter(BatchImage.batch_id == batch_id).delete(synchronize_session=False)
+                    # Remove batch
+                    session.query(Batch).filter(Batch.id == batch_id).delete(synchronize_session=False)
+                    session.commit()
+                    embedding_processor_logger.info(f"Removed batch {batch_id} from database.")
+                except Exception as e:
+                    session.rollback()
+                    embedding_processor_logger.error(f"Error removing batch {batch_id} from database: {e}", exc_info=True)
+                # Delete batch directory
+                shutil.rmtree(batch_dir, ignore_errors=True)
+                # Decrement the counter and notify downloader
+                with condition:
+                    config.current_batches_on_disk -= 1
+                    condition.notify()
+                batch_queue.task_done()
+                continue
 
             # Now process images in batch
             (embeddings_data, total_images_processed_in_batch, total_faces_detected,
@@ -276,6 +351,28 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
             total_faces = total_faces_detected
             images_with_faces = images_with_faces_count
             images_without_faces = images_without_faces_count
+
+            if not embeddings_data:
+                embedding_processor_logger.warning(f"No embeddings generated for batch {batch_id}. Removing batch from database.")
+                # Remove batch from database
+                try:
+                    # Remove from BatchImage
+                    session.query(BatchImage).filter(BatchImage.batch_id == batch_id).delete(synchronize_session=False)
+                    # Remove batch
+                    session.query(Batch).filter(Batch.id == batch_id).delete(synchronize_session=False)
+                    session.commit()
+                    embedding_processor_logger.info(f"Removed batch {batch_id} from database.")
+                except Exception as e:
+                    session.rollback()
+                    embedding_processor_logger.error(f"Error removing batch {batch_id} from database: {e}", exc_info=True)
+                # Delete batch directory
+                shutil.rmtree(batch_dir, ignore_errors=True)
+                # Decrement the counter and notify downloader
+                with condition:
+                    config.current_batches_on_disk -= 1
+                    condition.notify()
+                batch_queue.task_done()
+                continue
 
             # Pass data for saving to database
             embeddings_queue.put((batch_id, embeddings_data))

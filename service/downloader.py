@@ -1,5 +1,6 @@
 # file: downloader.py
 # directory: .
+
 import os
 import threading
 import time
@@ -11,8 +12,8 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from utils import configure_thread_logging, get_session_factory, get_engine
-from models import ArchivedImage
-import config  # Импортируем модуль конфигурации
+from models import ArchivedImage, Image, BatchImage, Batch
+import config  # Import configuration module
 
 
 def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, download_dir, download_threads,
@@ -24,7 +25,7 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
     SessionFactory = get_session_factory(get_engine())
     session = SessionFactory()
 
-    # Создаем ThreadPoolExecutor один раз
+    # Create ThreadPoolExecutor once
     executor = ThreadPoolExecutor(max_workers=download_threads)
 
     while True:
@@ -50,7 +51,7 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                 page_queue.task_done()
                 continue
 
-            # **Отправляем задачу на запись батча в базу данных**
+            # Send task to store batch in database
             db_queue.put(('store_batch', (page_number, image_urls)))
 
             # Wait until current_batches_on_disk < MAX_BATCHES_ON_DISK
@@ -59,23 +60,39 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                     condition.wait()
                 config.current_batches_on_disk += 1  # Increment the counter
 
-            # **Начинаем загрузку изображений сразу, без ожидания записи батча в базу данных**
+            # Wait for batch_info from db_writer
+            batch_info = batch_ready_queue.get()
+            if batch_info is None:
+                batch_ready_queue.task_done()
+                downloader_logger.error(f"Failed to create batch for page {page_url}.")
+                # Decrease counter of current batches on disk
+                with condition:
+                    config.current_batches_on_disk -= 1
+                    condition.notify()
+                page_queue.task_done()
+                continue
 
-            # Генерируем имена файлов на основе URL
-            filenames = [os.path.basename(urlparse(url).path) for url in image_urls]
+            batch_id = batch_info['batch_id']
+            image_ids = batch_info['image_ids']
+            filenames = batch_info['filenames']
+            image_urls = batch_info['image_urls']
+            image_paths = batch_info['paths']  # Ensure 'paths' are included
 
-            # Создаем директорию для батча
-            batch_dir_name = f"batch_{page_number}"
+            filename_to_id = dict(zip(filenames, image_ids))
+            id_to_url = dict(zip(image_ids, image_urls))
+
+            # Update batch_info with actual information
+            batch_dir_name = f"batch_{batch_id}"
             batch_dir = os.path.join(download_dir, batch_dir_name)
             os.makedirs(batch_dir, exist_ok=True)
+            batch_info['batch_dir'] = batch_dir
 
             # Map filenames to URLs
             filename_to_url = dict(zip(filenames, image_urls))
 
-            # **Оптимизируем запрос к базе данных для ArchivedImage**
-
+            # Optimize database query for ArchivedImage
             if archive_enabled:
-                # Получаем все ArchivedImage для текущего батча по именам файлов одним запросом
+                # Get all ArchivedImage for current batch by filenames in one query
                 try:
                     archived_images = session.query(ArchivedImage).filter(ArchivedImage.filename.in_(filenames)).all()
                     archived_filenames = {img.filename for img in archived_images}
@@ -89,19 +106,21 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                 filename_to_archive_url = {}
 
             images_to_download = []
+            failed_downloads = []  # List to keep track of failed downloads
+
             for filename in filenames:
                 if archive_enabled and filename in archived_filenames:
-                    # Изображение есть в архиве
+                    # Image is in archive
                     archive_url = filename_to_archive_url[filename]
                     local_path = os.path.join(batch_dir, filename)
                     success = download_image(archive_url, local_path, downloader_logger, stats_collector)
                     if not success:
-                        # Если загрузка из архива не удалась, добавляем в список для загрузки из источника
+                        # If download from archive failed, add to list for downloading from source
                         images_to_download.append(filename)
                 else:
                     images_to_download.append(filename)
 
-            # Теперь загружаем изображения, не найденные в архиве
+            # Now download images not found in archive or failed to download from archive
             if images_to_download:
                 futures = []
 
@@ -109,65 +128,84 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
                     img_url = filename_to_url[filename]
                     local_path = os.path.join(batch_dir, filename)
                     future = executor.submit(download_image, img_url, local_path, downloader_logger, stats_collector)
+                    future.filename = filename  # Attach filename to future for later identification
                     futures.append(future)
 
-                # Ждем завершения всех загрузок для данного батча
+                # Wait for all downloads to complete for this batch
                 wait(futures)
 
-                # Проверяем результаты загрузок
-                failed_downloads = []
+                # Check download results
                 for future in futures:
                     result = future.result()
                     if not result:
-                        failed_downloads.append(future)
+                        failed_downloads.append(future.filename)
 
-                if failed_downloads:
-                    downloader_logger.warning(f"Batch for page {page_number} has failed downloads.")
-                    # Решаем, что делать с неудачными загрузками
-                    # Например, можно удалить батч и пропустить его
-                    # Или продолжить обработку с имеющимися файлами
-                else:
-                    downloader_logger.info(f"All images for batch from page {page_number} downloaded successfully.")
-
+            # Handle failed downloads
+            if failed_downloads:
+                downloader_logger.warning(f"Failed to download images: {failed_downloads}")
+                # Remove image records from database for failed downloads
+                try:
+                    # Remove from BatchImage
+                    session.query(BatchImage).filter(BatchImage.batch_id == batch_id,
+                                                     BatchImage.image_id.in_(
+                                                         [filename_to_id[fn] for fn in failed_downloads])
+                                                     ).delete(synchronize_session=False)
+                    # Remove from Image
+                    session.query(Image).filter(Image.id.in_([filename_to_id[fn] for fn in failed_downloads])
+                                                ).delete(synchronize_session=False)
+                    session.commit()
+                    downloader_logger.info(f"Removed failed images from database: {failed_downloads}")
+                except Exception as e:
+                    session.rollback()
+                    downloader_logger.error(f"Error removing failed images from database: {e}", exc_info=True)
             else:
-                downloader_logger.info(f"All images for batch from page {page_number} were downloaded from archive.")
+                downloader_logger.info(f"All images for batch {batch_id} downloaded successfully.")
 
-            # **Ждём, пока батч будет записан в базу данных**
-            batch_info = batch_ready_queue.get()
-            if batch_info is None:
-                batch_ready_queue.task_done()
-                downloader_logger.error(f"Failed to create batch for page {page_url}.")
-                # Удаляем загруженные файлы и директорию
+            # Now check if there are any images left in the batch after removing failed downloads
+            remaining_images = [fn for fn in filenames if fn not in failed_downloads]
+            if not remaining_images:
+                downloader_logger.warning(f"No images left in batch {batch_id} after removing failed downloads.")
+                # Remove batch from database
+                try:
+                    # Remove from BatchImage
+                    session.query(BatchImage).filter(BatchImage.batch_id == batch_id).delete(synchronize_session=False)
+                    # Remove batch
+                    session.query(Batch).filter(Batch.id == batch_id).delete(synchronize_session=False)
+                    session.commit()
+                    downloader_logger.info(f"Removed batch {batch_id} from database.")
+                except Exception as e:
+                    session.rollback()
+                    downloader_logger.error(f"Error removing batch {batch_id} from database: {e}", exc_info=True)
+                # Delete batch directory
                 shutil.rmtree(batch_dir, ignore_errors=True)
-                # Уменьшаем счетчик текущих батчей на диске
+                # Decrease counter of current batches on disk
                 with condition:
                     config.current_batches_on_disk -= 1
                     condition.notify()
+                # Inform the processor to skip this batch
+                batch_ready_queue.task_done()
+                # Since we are not adding to batch_queue, we need to task_done for batch_queue as well
+                batch_queue.task_done()
                 page_queue.task_done()
                 continue
+            else:
+                # Update batch_info to reflect remaining images
+                batch_info['filenames'] = remaining_images
+                batch_info['image_ids'] = [filename_to_id[fn] for fn in remaining_images]
+                batch_info['image_urls'] = [filename_to_url[fn] for fn in remaining_images]
+                batch_info['paths'] = [batch_info['paths'][filenames.index(fn)] for fn in remaining_images]
+                # Now, when batch is ready and all images are downloaded, add it to processing queue
+                batch_queue.put(batch_info)
+                downloader_logger.info(f"Batch {batch_id} added to processing queue.")
 
-            batch_id = batch_info['batch_id']
-            image_ids = batch_info['image_ids']
-            # Обновляем batch_info с актуальной информацией
-            batch_info.update({
-                'batch_dir': batch_dir,
-                'filenames': filenames,
-                'image_urls': image_urls,
-                'paths': batch_info['paths'],  # Ensure 'paths' are included
-            })
-
-            # Теперь, когда батч готов и все изображения загружены, добавляем его в очередь на обработку
-            batch_queue.put(batch_info)
-            downloader_logger.info(f"Batch {batch_id} added to processing queue.")
-
-            batch_ready_queue.task_done()
+                batch_ready_queue.task_done()
 
         except Exception as e:
             downloader_logger.error(f"Error processing page {page_number}: {e}", exc_info=True)
-            # Удаляем загруженные файлы и директорию в случае ошибки
+            # Delete downloaded files and directory in case of error
             if 'batch_dir' in locals():
                 shutil.rmtree(batch_dir, ignore_errors=True)
-            # Уменьшаем счетчик текущих батчей на диске
+            # Decrease counter of current batches on disk
             with condition:
                 config.current_batches_on_disk -= 1
                 condition.notify()
@@ -176,7 +214,7 @@ def downloader_thread(page_queue, batch_queue, db_queue, batch_ready_queue, down
             stats_collector.add_batch_processing_time('downloader', processing_time)
             page_queue.task_done()
 
-    # Ожидаем завершения всех задач перед завершением
+    # Wait for all tasks to complete before shutting down
     executor.shutdown(wait=True)
     session.close()
 
@@ -220,7 +258,7 @@ def get_total_pages_for_query(query):
     try:
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Ищем элемент с классом 'numberofpages'
+        # Look for element with class 'numberofpages'
         numberofpages_element = soup.find('a', class_='numberofpages')
         if numberofpages_element:
             total_pages_text = numberofpages_element.text.strip('..')
@@ -231,7 +269,7 @@ def get_total_pages_for_query(query):
                 print(f"Could not parse total pages from text: {total_pages_text}")
                 return 1
         else:
-            # Если элемент не найден, проверяем наличие постов
+            # If element not found, check for posts
             posts = soup.find_all('div', class_='post-container')
             if posts:
                 return 1
