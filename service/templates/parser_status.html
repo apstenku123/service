@@ -1,7 +1,10 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Parser Status</title>
+    <!-- Подключаем Bootstrap CSS -->
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <style>
@@ -21,13 +24,16 @@
 </head>
 <body>
     <div class="container">
+        <!-- Заголовок со статусом парсера -->
         <h1 class="mt-5">Parser Status: <span id="status-text" class="status-{{ status }}">{{ status }}</span></h1>
         <p><strong>Instance ID:</strong> {{ instance_id }}</p>
         <p><strong>Host Name:</strong> {{ host_name }}</p>
         <p><strong>Total Servers:</strong> {{ total_servers }}</p>
 
+        <!-- Панель управления: форма запуска или остановки парсера -->
         <div id="control-panel" class="mb-4">
             {% if status == 'stopped' %}
+            <!-- Форма запуска парсера -->
             <form action="/start_parser" method="post" class="card p-3 bg-light">
                 <div class="form-group">
                     <label for="start">Start Position:</label>
@@ -41,7 +47,7 @@
                     <label for="query">Query (optional):</label>
                     <input type="text" class="form-control" id="query" name="query">
                 </div>
-                <!-- Добавляем остальные параметры из main.py -->
+                <!-- Дополнительные параметры -->
                 <div class="form-group">
                     <label for="download_threads">Download Threads:</label>
                     <input type="number" class="form-control" id="download_threads" name="download_threads" value="8">
@@ -83,12 +89,12 @@
                         <option value="s">Sequential</option>
                     </select>
                 </div>
-                <!-- Добавляем чекбоксы для boolean параметров -->
+                <!-- Чекбоксы для булевых параметров -->
                 <div class="form-group form-check">
                     <input type="checkbox" class="form-check-input" id="archive" name="archive">
                     <label class="form-check-label" for="archive">Enable Archiving</label>
                 </div>
-                <!-- Поля для archive_type и archive_config -->
+                <!-- Параметры архивирования -->
                 <div class="form-group">
                     <label for="archive_type">Archive Type:</label>
                     <select class="form-control" id="archive_type" name="archive_type">
@@ -110,12 +116,14 @@
                 <button type="submit" class="btn btn-primary">Start Parser</button>
             </form>
             {% else %}
+            <!-- Форма остановки парсера -->
             <form action="/stop_parser" method="post">
                 <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
             </form>
             {% endif %}
         </div>
 
+        <!-- Блок текущей статистики -->
         <div class="card mb-4">
             <div class="card-header">
                 <h2 class="mb-0">Current Statistics</h2>
@@ -125,6 +133,7 @@
             </div>
         </div>
 
+        <!-- Таблица истории запусков -->
         <div class="card">
             <div class="card-header">
                 <h2 class="mb-0">Run History</h2>
@@ -150,9 +159,11 @@
                                 <td><pre class="mb-0">{{ run.parameters | tojson(indent=2) }}</pre></td>
                                 <td>
                                     <div class="btn-group btn-group-sm">
-                                        <a href="{{ url_for('view_run_stats', run_id=run.id) }}"
-                                           class="btn btn-info">View Stats</a>
-                                        <!-- Дополнительные действия можно добавить здесь -->
+                                        <a href="{{ url_for('view_run_stats', run_id=run.id) }}" class="btn btn-info">View Stats</a>
+                                        <a href="{{ url_for('list_logs', run_id=run.id) }}" class="btn btn-warning">View Logs</a>
+                                        {% if run.log_archive %}
+                                        <a href="{{ url_for('download_logs', run_id=run.id) }}" class="btn btn-success">Download Logs</a>
+                                        {% endif %}
                                     </div>
                                 </td>
                             </tr>
@@ -164,6 +175,7 @@
         </div>
     </div>
 
+    <!-- Скрипт для обновления статуса и динамического обновления формы -->
     <script>
         // Функция для обновления статуса и статистики
         function updateStatus() {
@@ -182,8 +194,89 @@
                 // Обновляем панель управления
                 const controlPanel = document.getElementById('control-panel');
                 if (data.status === 'stopped' && !document.getElementById('start')) {
-                    controlPanel.innerHTML = `<!-- Здесь повторяем форму запуска парсера -->`;
                     // Повторяем форму запуска с параметрами
+                    controlPanel.innerHTML = `
+                        <form action="/start_parser" method="post" class="card p-3 bg-light">
+                            <div class="form-group">
+                                <label for="start">Start Position:</label>
+                                <input type="number" class="form-control" id="start" name="start" value="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="limit">Limit:</label>
+                                <input type="number" class="form-control" id="limit" name="limit" value="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="query">Query (optional):</label>
+                                <input type="text" class="form-control" id="query" name="query">
+                            </div>
+                            <div class="form-group">
+                                <label for="download_threads">Download Threads:</label>
+                                <input type="number" class="form-control" id="download_threads" name="download_threads" value="8">
+                            </div>
+                            <div class="form-group">
+                                <label for="batch_size">Batch Size:</label>
+                                <input type="number" class="form-control" id="batch_size" name="batch_size" value="16">
+                            </div>
+                            <div class="form-group">
+                                <label for="report_dir">Report Directory:</label>
+                                <input type="text" class="form-control" id="report_dir" name="report_dir" value="reports">
+                            </div>
+                            <div class="form-group">
+                                <label for="stats_interval">Stats Interval:</label>
+                                <input type="number" class="form-control" id="stats_interval" name="stats_interval" value="10">
+                            </div>
+                            <div class="form-group">
+                                <label for="log_level">Log Level:</label>
+                                <select class="form-control" id="log_level" name="log_level">
+                                    <option value="DEBUG">DEBUG</option>
+                                    <option value="INFO" selected>INFO</option>
+                                    <option value="WARNING">WARNING</option>
+                                    <option value="ERROR">ERROR</option>
+                                    <option value="CRITICAL">CRITICAL</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="log_output">Log Output:</label>
+                                <select class="form-control" id="log_output" name="log_output">
+                                    <option value="file" selected>File</option>
+                                    <option value="console">Console</option>
+                                    <option value="both">Both</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="mode">Mode:</label>
+                                <select class="form-control" id="mode" name="mode">
+                                    <option value="t" selected>Threaded</option>
+                                    <option value="s">Sequential</option>
+                                </select>
+                            </div>
+                            <!-- Чекбоксы для булевых параметров -->
+                            <div class="form-group form-check">
+                                <input type="checkbox" class="form-check-input" id="archive" name="archive">
+                                <label class="form-check-label" for="archive">Enable Archiving</label>
+                            </div>
+                            <!-- Параметры архивирования -->
+                            <div class="form-group">
+                                <label for="archive_type">Archive Type:</label>
+                                <select class="form-control" id="archive_type" name="archive_type">
+                                    <option value="">Select Archive Type</option>
+                                    <option value="s3">S3</option>
+                                    <option value="azure">Azure</option>
+                                    <option value="ftp">FTP</option>
+                                    <option value="sftp">SFTP</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="archive_config">Archive Config Path:</label>
+                                <input type="text" class="form-control" id="archive_config" name="archive_config">
+                            </div>
+                            <div class="form-group">
+                                <label for="archive_threads">Archive Threads:</label>
+                                <input type="number" class="form-control" id="archive_threads" name="archive_threads" value="4">
+                            </div>
+                            <button type="submit" class="btn btn-primary">Start Parser</button>
+                        </form>
+                    `;
                 } else if (data.status === 'running' && !document.querySelector('form[action="/stop_parser"]')) {
                     controlPanel.innerHTML = `
                         <form action="/stop_parser" method="post">
@@ -195,7 +288,7 @@
         }
 
         // Обновляем статус каждые 5 секунд
-        setInterval(updateStatus, 5000);
+        setInterval(updateStatus, 2000);
     </script>
 </body>
 </html>

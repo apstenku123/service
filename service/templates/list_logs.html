@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Logs for Run {{ run_id }}</title>
+</head>
+<body>
+    <h1>Logs for Run {{ run_id }}</h1>
+    <ul>
+        {% for log in logs %}
+            <li><a href="{{ url_for('view_log', run_id=run_id, log_file=log) }}">{{ log }}</a></li>
+        {% endfor %}
+    </ul>
+    <a href="/">Back to main page</a>
+</body>
+</html>
