@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -15,6 +16,11 @@ import shutil
 import tarfile
 import io
 import xlsxwriter
+import logging
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 parser_state = {'status': 'stopped', 'stats': {}}
 status_lock = threading.Lock()
@@ -31,6 +37,7 @@ os.makedirs(app.config['FAVICON_FOLDER'], exist_ok=True)
 parser_process = None
 stdout_thread = None
 stderr_thread = None
+monitor_thread = None
 parser_stats = {}
 parser_lock = threading.Lock()
 current_run_id = None
@@ -76,6 +83,43 @@ Base.metadata.create_all(engine)
 INSTANCE_ID = int(os.getenv("INSTANCE_ID", "0"))
 TOTAL_SERVERS = int(os.getenv("TOTAL_SERVERS", "1"))
 HOST_NAME = os.uname()[1]
+
+def monitor_parser_process(run_id):
+    global parser_process, current_run_id
+    logger.info(f"Monitor thread started for run_id: {run_id}")
+    i = 0
+    while True:
+        time.sleep(1)
+        i = i + 1
+        if parser_process is not None:
+            if parser_process.is_running():
+                # Процесс все еще работает
+                if i % 5 == 0:
+                    logger.info(f"Parser process with PID {parser_process.pid} is running.")
+                continue
+            else:
+                # Процесс завершился
+                logger.info(f"Parser process with PID {parser_process.pid} has terminated.")
+        else:
+            logger.info("Parser process is None.")
+
+        with status_lock:
+            parser_state['status'] = 'stopped'
+            parser_state['stats'] = {}
+
+        # Обновляем run в базе данных
+        update_run_in_db(run_id, end_time=datetime.utcnow())
+
+        # Очищаем глобальные переменные
+        current_run_id = None
+        parser_process = None
+
+        # Очищаем статистику и stats.json
+        if os.path.exists('stats.json'):
+            os.remove('stats.json')
+        with parser_lock:
+            parser_stats = {}
+        break
 
 def read_output(pipe, log_file):
     with open(log_file, 'w') as f:
@@ -194,6 +238,7 @@ def start_parser():
     global current_run_id
     global stdout_thread
     global stderr_thread
+    global monitor_thread
 
     data = request.form or request.json or {}
     # Получаем все параметры из запроса
@@ -257,7 +302,7 @@ def start_parser():
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=1,
+        bufsize=128*1024,
         universal_newlines=True
     )
 
@@ -270,6 +315,7 @@ def start_parser():
     session.close()
 
     parser_process = psutil.Process(parser_subprocess.pid)
+    print("started parser process with pid", parser_subprocess.pid)
 
     stdout_log_file = f'logs/run_{current_run_id}_stdout.log'
     stderr_log_file = f'logs/run_{current_run_id}_stderr.log'
@@ -283,6 +329,11 @@ def start_parser():
     stats_thread = threading.Thread(target=collect_stats, args=(current_run_id,))
     stats_thread.daemon = True
     stats_thread.start()
+
+    # Запускаем поток мониторинга процесса
+    monitor_thread = threading.Thread(target=monitor_parser_process, args=(current_run_id,))
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
     with status_lock:
         parser_state['status'] = 'running'
