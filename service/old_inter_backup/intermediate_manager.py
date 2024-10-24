@@ -1,9 +1,11 @@
+# file: intermediate_manager.py
+# directory: old_inter_backup
 import os
 import subprocess
 import threading
 import time
 import json
-import psutil
+import psutil  # New import for process management
 from datetime import datetime
 
 import sqlalchemy
@@ -16,18 +18,65 @@ import tarfile
 import io
 import xlsxwriter
 
-parser_state = {'status': 'stopped', 'stats': {}}
+# New imports for SocketIO
+from flask_socketio import SocketIO, emit, join_room, leave_room
+# Добавьте новый импорт в начало файла
+from threading import Timer
+import threading
+
+parser_state = {'status': 'stopped', 'stats': {}}  # было parser_status
 status_lock = threading.Lock()
 
+
+class StatusBroadcaster:
+    def __init__(self, socketio):
+        self.socketio = socketio
+        self.timer = None
+        self.running = True
+        self.last_stats = {}
+
+    def start(self):
+        self.running = True
+        self.broadcast_status()
+
+    def stop(self):
+        self.running = False
+        if self.timer:
+            self.timer.cancel()
+
+    def broadcast_status(self):
+        if not self.running:
+            return
+
+        global parser_process, parser_stats, parser_state
+        with status_lock:
+            current_status = 'running' if (parser_process and parser_process.is_running()) else 'stopped'
+            parser_state['status'] = current_status
+
+            # Проверяем, изменилась ли статистика
+            if parser_stats != self.last_stats:
+                parser_state['stats'] = parser_stats.copy()
+                self.last_stats = parser_stats.copy()
+                self.socketio.emit('parser_status', parser_state)
+                print("Broadcasted updated status and stats")
+
+        self.timer = Timer(1.0, self.broadcast_status)
+        self.timer.start()
+
+
 app = Flask(__name__, template_folder='templates')
-app.config['SECRET_KEY'] = 'your_secret_key'
+app.config['SECRET_KEY'] = 'your_secret_key'  # Set a secret key for SocketIO
+socketio = SocketIO(app)  # Initialize SocketIO
+
+# После создания socketio добавьте:
+broadcaster = StatusBroadcaster(socketio)
 
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['FAVICON_FOLDER'] = 'favicon'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['FAVICON_FOLDER'], exist_ok=True)
 
-# Глобальные переменные для процесса парсера и потоков
+# Global variables for parser process and threads
 parser_process = None
 stdout_thread = None
 stderr_thread = None
@@ -35,7 +84,7 @@ parser_stats = {}
 parser_lock = threading.Lock()
 current_run_id = None
 
-# Конфигурация базы данных
+# Database configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_NAME = os.getenv("DB_NAME", "mydatabase")
 DB_USER = os.getenv("DB_USER", "myuser")
@@ -46,7 +95,7 @@ engine = create_engine(DATABASE_URL)
 Base = sqlalchemy.orm.declarative_base()
 Session = sessionmaker(bind=engine)
 
-# Определение моделей базы данных
+# Define database models
 class ParserRun(Base):
     __tablename__ = 'parser_runs'
     id = Column(Integer, primary_key=True)
@@ -57,7 +106,7 @@ class ParserRun(Base):
     parameters = Column(JSON, nullable=True)
     command_line = Column(String, nullable=True)
     log_archive = Column(String, nullable=True)
-    pid = Column(Integer, nullable=True)
+    pid = Column(Integer, nullable=True)  # New field for process ID
     stats_history = relationship("ParserRunStats", back_populates="parser_run", cascade="all, delete-orphan")
 
 class ParserRunStats(Base):
@@ -69,10 +118,10 @@ class ParserRunStats(Base):
     incremental_stats = Column(JSON, nullable=True)
     parser_run = relationship("ParserRun", back_populates="stats_history")
 
-# Создание таблиц, если их нет
+# Create tables if they don't exist
 Base.metadata.create_all(engine)
 
-# Получение ID инстанса и информации о сервере
+# Get instance ID and server information
 INSTANCE_ID = int(os.getenv("INSTANCE_ID", "0"))
 TOTAL_SERVERS = int(os.getenv("TOTAL_SERVERS", "1"))
 HOST_NAME = os.uname()[1]
@@ -107,11 +156,14 @@ def calculate_incremental_stats(previous_stats, current_stats):
             incremental_stats[key] = current_stats[key]
     return incremental_stats
 
+
+# collect_stats
 def collect_stats(run_id):
     global parser_stats, parser_state
-    previous_stats = {}
+    previous_stats = None
     last_modified_time = None
     session = Session()
+    room = f"run_{run_id}"
 
     try:
         while True:
@@ -148,10 +200,23 @@ def collect_stats(run_id):
                             session.add(stats_entry)
                             session.commit()
 
-                            # Обновляем общий статус парсера
-                            with status_lock:
-                                parser_state['stats'] = current_stats.copy()
-                                parser_state['last_update'] = str(stats_entry.timestamp)
+                            # Отправляем статистику во все комнаты
+                            socketio.emit('new_stats', {
+                                'timestamp': str(stats_entry.timestamp),
+                                'stats': current_stats,
+                                'incremental_stats': incremental_stats,
+                                'run_id': run_id
+                            })  # Отправляем всем
+
+                            # И отдельно в комнату конкретного запуска
+                            socketio.emit('new_stats', {
+                                'timestamp': str(stats_entry.timestamp),
+                                'stats': current_stats,
+                                'incremental_stats': incremental_stats,
+                                'run_id': run_id
+                            }, room=room)
+
+                            print(f"Emitted stats globally and to room {room}")
 
                         except json.JSONDecodeError as e:
                             print(f"JSON decode error: {e}")
@@ -167,22 +232,76 @@ def collect_stats(run_id):
     finally:
         session.close()
 
+def check_for_existing_run():
+    """Check if there is a parser process from a previous run and attempt to regain control."""
+    global parser_process
+    global current_run_id
+    global stdout_thread
+    global stderr_thread
+
+    session = Session()
+    run = session.query(ParserRun).filter_by(instance_id=INSTANCE_ID, end_time=None).order_by(ParserRun.start_time.desc()).first()
+    session.close()
+    if run and run.pid:
+        try:
+            # Check if the process is still running
+            existing_process = psutil.Process(run.pid)
+            if existing_process.is_running() and 'python' in existing_process.name():
+                # Regain control over the process
+                parser_process = existing_process
+                current_run_id = run.id
+
+                # Reattach to stdout and stderr
+                # Note: This is complex because once the parent process ends, the pipes are broken.
+                # We cannot reattach to the pipes of an existing process.
+                # So, we may not be able to read stdout/stderr unless we have redirected them to files.
+                # For simplicity, we'll note that we cannot reattach to stdout/stderr.
+
+                # Start collecting stats again
+                stats_thread = threading.Thread(target=collect_stats, args=(current_run_id,))
+                stats_thread.daemon = True
+                stats_thread.start()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # The process is not running anymore, update the run's end time
+            update_run_in_db(run.id, end_time=datetime.datetime.now(datetime.UTC))
+            parser_process = None
+            current_run_id = None
+
+# Call the function on startup
+check_for_existing_run()
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    # Отправляем текущий статус новому клиенту
+    with status_lock:
+        socketio.emit('parser_status', parser_state, room=request.sid)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('join')
+def on_join(data):
+    room = f"run_{data['run_id']}"
+    join_room(room)
+    print(f'Client joined room: {room}')
+
+@socketio.on('leave')
+def on_leave(data):
+    room = f"run_{data['run_id']}"
+    leave_room(room)
+    print(f'Client left room: {room}')
+
 @app.route('/favicon.ico')
 def favicon():
     return send_from_directory(app.config['FAVICON_FOLDER'], 'favicon.ico', mimetype='image/vnd.microsoft.icon')
 
 @app.route('/', methods=['GET'])
 def index():
-    global parser_process, parser_stats
     status = 'stopped'
     if parser_process and parser_process.is_running():
         status = 'running'
-    else:
-        # Если парсер не запущен, очищаем stats.json
-        if os.path.exists('stats.json'):
-            os.remove('stats.json')
-            with parser_lock:
-                parser_stats = {}
     session = Session()
     runs = session.query(ParserRun).filter_by(instance_id=INSTANCE_ID).order_by(ParserRun.start_time.desc()).all()
     session.close()
@@ -194,50 +313,23 @@ def start_parser():
     global current_run_id
     global stdout_thread
     global stderr_thread
-
-    data = request.form or request.json or {}
-    # Получаем все параметры из запроса
-    parser_args = {
-        'limit': data.get('limit', '1'),
-        'start': data.get('start', '1'),
-        'download_threads': data.get('download_threads', '8'),
-        'batch_size': data.get('batch_size', '16'),
-        'report_dir': data.get('report_dir', 'reports'),
-        'stats_interval': data.get('stats_interval', '10'),
-        'log_level': data.get('log_level', 'INFO'),
-        'log_output': data.get('log_output', 'file'),
-        'loggers': data.get('loggers', ''),
-        'archive': data.get('archive', False),
-        'archive_type': data.get('archive_type', ''),
-        'archive_config': data.get('archive_config', ''),
-        'archive_threads': data.get('archive_threads', '4'),
-        'service': data.get('service', False),
-        'port': data.get('port', '8070'),
-        'query': data.get('query', ''),
-        'mode': data.get('mode', 't')
-    }
+    data = request.form
+    start = data.get('start', 0)
+    limit = data.get('limit', 50)
+    query = data.get('query', '')
 
     if parser_process and parser_process.is_running():
         return jsonify({'status': 'Parser is already running'}), 400
 
-    # Формируем команду для запуска парсера
-    command = ['python', 'main.py']
-    for key, value in parser_args.items():
-        if isinstance(value, bool):
-            if value:
-                command.append(f'--{key.replace("_", "-")}')
-        elif value:
-            command.append(f'--{key.replace("_", "-")}')
-            command.append(str(value))
-
-    # Сохраняем параметры для записи в базу данных
-    parameters = parser_args.copy()
+    command = ['python', 'main.py', '-s', str(start), '-l', str(limit)]
+    if query:
+        command.extend(['-q', query])
 
     session = Session()
     new_run = ParserRun(
         instance_id=INSTANCE_ID,
         host=HOST_NAME,
-        parameters=parameters,
+        parameters={'start': start, 'limit': limit, 'query': query},
         command_line=' '.join(command)
     )
     session.add(new_run)
@@ -247,21 +339,15 @@ def start_parser():
 
     os.environ['RUN_ID'] = str(current_run_id)
 
-    # Если файл stats.json существует и парсер не запущен, удаляем его
-    if os.path.exists('stats.json'):
-        os.remove('stats.json')
-        with parser_lock:
-            parser_stats = {}
-
     parser_subprocess = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=1,
+        bufsize=1,  # Line-buffered
         universal_newlines=True
     )
 
-    # Сохраняем PID в базе данных
+    # Save the PID to the database
     session = Session()
     run = session.query(ParserRun).filter_by(id=current_run_id).first()
     if run:
@@ -286,8 +372,9 @@ def start_parser():
 
     with status_lock:
         parser_state['status'] = 'running'
+        socketio.emit('parser_status', parser_state)
 
-    return jsonify({'status': 'Parser started', 'run_id': current_run_id}), 200
+    return redirect(url_for('index'))
 
 @app.route('/stop_parser', methods=['POST'])
 def stop_parser():
@@ -296,9 +383,9 @@ def stop_parser():
     if parser_process and parser_process.is_running():
         try:
             parser_process.terminate()
-            parser_process.wait(timeout=5)
+            parser_process.wait(timeout=5)  # Ждем максимум 5 секунд
         except psutil.TimeoutExpired:
-            parser_process.kill()
+            parser_process.kill()  # Если не остановился - убиваем
 
         parser_process = None
 
@@ -310,22 +397,15 @@ def stop_parser():
         update_run_in_db(current_run_id, end_time=datetime.utcnow())
         current_run_id = None
 
-        # Очищаем статистику и stats.json
-        if os.path.exists('stats.json'):
-            os.remove('stats.json')
+        # Очищаем статистику
         with status_lock:
             parser_state['status'] = 'stopped'
             parser_state['stats'] = {}
-        with parser_lock:
-            parser_stats = {}
+            socketio.emit('parser_status', parser_state)
 
-        return jsonify({'status': 'Parser stopped'}), 200
+        return redirect(url_for('index'))
     else:
         return jsonify({'status': 'Parser is not running'}), 400
-
-@app.route('/start_parser_api', methods=['POST'])
-def start_parser_api():
-    return start_parser()
 
 @app.route('/archive_logs/<int:run_id>')
 def archive_logs(run_id):
@@ -337,8 +417,7 @@ def collect_logs_for_run(run_id):
     run = session.query(ParserRun).filter_by(id=run_id).first()
     if run and run.log_archive:
         session.close()
-        return
-
+        return  # Logs already archived
     log_dir = 'logs'
     run_log_dir = f'logs/run_{run_id}'
     os.makedirs(run_log_dir, exist_ok=True)
@@ -363,11 +442,10 @@ def collect_logs_for_run(run_id):
 @app.route('/parser_status', methods=['GET'])
 def get_parser_status():
     global parser_process
-    with status_lock:
-        status = parser_state.get('status', 'stopped')
-        stats = parser_state.get('stats', {})
-        last_update = parser_state.get('last_update', None)
-    return jsonify({'status': status, 'stats': stats, 'last_update': last_update}), 200
+    status = 'stopped'
+    if parser_process and parser_process.is_running():
+        status = 'running'
+    return jsonify({'status': status, 'stats': parser_stats}), 200
 
 @app.route('/view_run_stats/<int:run_id>')
 def view_run_stats(run_id):
@@ -379,20 +457,6 @@ def view_run_stats(run_id):
     stats_entries = session.query(ParserRunStats).filter_by(run_id=run_id).order_by(ParserRunStats.timestamp).all()
     session.close()
     return render_template('run_stats.html', run=run, stats_entries=stats_entries, instance_id=INSTANCE_ID, host_name=HOST_NAME, total_servers=TOTAL_SERVERS)
-
-@app.route('/get_run_stats/<int:run_id>')
-def get_run_stats(run_id):
-    session = Session()
-    stats_entries = session.query(ParserRunStats).filter_by(run_id=run_id).order_by(ParserRunStats.timestamp).all()
-    session.close()
-    data = []
-    for entry in stats_entries:
-        data.append({
-            'timestamp': entry.timestamp.isoformat(),
-            'stats': entry.stats,
-            'incremental_stats': entry.incremental_stats
-        })
-    return jsonify(data)
 
 @app.route('/export_stats/<int:run_id>')
 def export_stats(run_id):
@@ -455,4 +519,9 @@ def download_logs(run_id):
     return send_from_directory(directory=os.path.dirname(run.log_archive), filename=os.path.basename(run.log_archive), as_attachment=True)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    try:
+        # Запускаем broadcaster после создания приложения
+        broadcaster.start()
+        socketio.run(app, host='0.0.0.0', port=8080)
+    finally:
+        broadcaster.stop()

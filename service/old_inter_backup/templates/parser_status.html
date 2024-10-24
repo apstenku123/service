@@ -1,0 +1,218 @@
+<!-- file: parser_status.html -->
+<!-- directory: old_inter_backup/templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parser Status</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <style>
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .status-running {
+            color: #28a745;
+            font-weight: bold;
+        }
+        .status-stopped {
+            color: #dc3545;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-5">Parser Status: <span id="status-text" class="status-{{ status }}">{{ status }}</span></h1>
+        <p><strong>Instance ID:</strong> {{ instance_id }}</p>
+        <p><strong>Host Name:</strong> {{ host_name }}</p>
+        <p><strong>Total Servers:</strong> {{ total_servers }}</p>
+
+        <div id="control-panel" class="mb-4">
+            {% if status == 'stopped' %}
+            <form action="/start_parser" method="post" class="card p-3 bg-light">
+                <div class="form-group">
+                    <label for="start">Start Position:</label>
+                    <input type="number" class="form-control" id="start" name="start" value="0">
+                </div>
+                <div class="form-group">
+                    <label for="limit">Limit:</label>
+                    <input type="number" class="form-control" id="limit" name="limit" value="50">
+                </div>
+                <div class="form-group">
+                    <label for="query">Query (optional):</label>
+                    <input type="text" class="form-control" id="query" name="query">
+                </div>
+                <button type="submit" class="btn btn-primary">Start Parser</button>
+            </form>
+            {% else %}
+            <form action="/stop_parser" method="post">
+                <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="mb-0">Current Statistics</h2>
+            </div>
+            <div class="card-body">
+                <pre id="current-stats" class="mb-0">{{ stats | tojson(indent=2) }}</pre>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2 class="mb-0">Run History</h2>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-bordered table-hover">
+                        <thead class="thead-dark">
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Parameters</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for run in runs %}
+                            <tr>
+                                <td>{{ run.id }}</td>
+                                <td>{{ run.start_time }}</td>
+                                <td>{{ run.end_time or 'Running' }}</td>
+                                <td><pre class="mb-0">{{ run.parameters | tojson(indent=2) }}</pre></td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <a href="{{ url_for('view_run_stats', run_id=run.id) }}"
+                                           class="btn btn-info">View Stats</a>
+                                        {% if run.log_archive %}
+                                            <a href="{{ url_for('download_logs', run_id=run.id) }}"
+                                               class="btn btn-success">Download Logs</a>
+                                        {% else %}
+                                            <a href="{{ url_for('archive_logs', run_id=run.id) }}"
+                                               class="btn btn-secondary">Archive Logs</a>
+                                        {% endif %}
+                                        <button onclick="confirmDelete({{ run.id }})"
+                                                class="btn btn-danger">Delete</button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Socket.IO
+        const socket = io({
+            transports: ['websocket'],
+            upgrade: false
+        });
+
+        // Connect event handler
+        socket.on('connect', () => {
+            console.log('WebSocket connected');
+            updateStatusDisplay('connected');
+        });
+
+        // Disconnect event handler
+        socket.on('disconnect', () => {
+            console.log('WebSocket disconnected');
+            updateStatusDisplay('disconnected');
+        });
+
+        socket.on('new_stats', function(data) {
+            lastStatsUpdate = Date.now();
+            // Обновляем статистику
+            const statsDisplay = document.getElementById('current-stats');
+            if (statsDisplay) {
+                statsDisplay.textContent = JSON.stringify(data.stats, null, 2);
+                console.log("Updated stats:", data.stats); // Для отладки
+            }
+        });
+
+        // Status update handler
+        socket.on('parser_status', function(data) {
+            console.log('Received status update:', data);
+
+            // Update status text and class
+            const statusText = document.getElementById('status-text');
+            statusText.textContent = data.status;
+            statusText.className = `status-${data.status}`;
+
+            // Update current stats
+            if (data.stats) {
+                document.getElementById('current-stats').textContent =
+                    JSON.stringify(data.stats, null, 2);
+            }
+
+            // Update control panel if status changed
+            const controlPanel = document.getElementById('control-panel');
+            if (data.status === 'stopped' && !document.getElementById('start')) {
+                controlPanel.innerHTML = `
+                    <form action="/start_parser" method="post" class="card p-3 bg-light">
+                        <div class="form-group">
+                            <label for="start">Start Position:</label>
+                            <input type="number" class="form-control" id="start" name="start" value="0">
+                        </div>
+                        <div class="form-group">
+                            <label for="limit">Limit:</label>
+                            <input type="number" class="form-control" id="limit" name="limit" value="50">
+                        </div>
+                        <div class="form-group">
+                            <label for="query">Query (optional):</label>
+                            <input type="text" class="form-control" id="query" name="query">
+                        </div>
+                        <button type="submit" class="btn btn-primary">Start Parser</button>
+                    </form>
+                `;
+            } else if (data.status === 'running' && !document.querySelector('form[action="/stop_parser"]')) {
+                controlPanel.innerHTML = `
+                    <form action="/stop_parser" method="post">
+                        <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+                    </form>
+                `;
+            }
+        });
+
+        // Function to update status display
+        function updateStatusDisplay(connectionStatus) {
+            const statusText = document.getElementById('status-text');
+            if (connectionStatus === 'disconnected') {
+                statusText.style.opacity = '0.5';
+            } else {
+                statusText.style.opacity = '1';
+            }
+        }
+
+        // Function to confirm deletion
+        function confirmDelete(runId) {
+            if (confirm('Are you sure you want to delete this run?')) {
+                window.location.href = `/delete_run/${runId}`;
+            }
+        }
+
+        // Auto-refresh functionality
+        let lastStatsUpdate = Date.now();
+
+        socket.on('new_stats', function(data) {
+            lastStatsUpdate = Date.now();
+            document.getElementById('current-stats').textContent =
+                JSON.stringify(data.stats, null, 2);
+        });
+
+        // Check for stale connection
+        setInterval(() => {
+            if (Date.now() - lastStatsUpdate > 10000) {  // 10 seconds
+                socket.connect();  // Try to reconnect if we haven't received updates
+            }
+        }, 5000);  // Check every 5 seconds
+    </script>
+</body>
+</html>

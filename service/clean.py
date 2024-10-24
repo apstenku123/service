@@ -16,6 +16,8 @@ QUEUE_NAME = os.environ.get('QUEUE_NAME')
 
 def drop_specific_tables():
     tables_to_drop = [
+        'parser_run_stats',
+        'parser_runs',
         'image_embeddings',
         'host_logs',
         'batch_logs',

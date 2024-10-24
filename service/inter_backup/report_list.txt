@@ -1,0 +1,5 @@
+inter_backup/
+    intermediate_manager.py
+templates/
+    parser_status.html
+    run_stats.html

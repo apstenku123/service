@@ -31,6 +31,13 @@ test_nv/
     test33.py
 al/
     env.py
+inter_backup/
+    update_headers.py
+    intermediate_manager.py
+    prepare_gpt.py
+    templates/
+        parser_status.html
+        run_stats.html
 tests/
     test_processor/
         test_processor.py
@@ -75,9 +82,22 @@ uploads/
 templates/
     index.html
     parser_status.html
+    run_stats.html
     results.html
+old_inter_backup/
+    update_headers.py
+    intermediate_manager.py
+    prepare_gpt.py
+    templates/
+        parser_status.html
+        run_stats.html
 downloads/
 favicon/
 logs/
     html_processor/
+    embeddings_writer/
+    embedding_processor/
+    db_writer/
+    stats_logger/
+    downloader/
     main/

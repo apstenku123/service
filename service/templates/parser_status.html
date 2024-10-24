@@ -1,49 +1,201 @@
-<!-- file: parser_status.html -->
-<!-- directory: templates -->
 <!DOCTYPE html>
 <html>
 <head>
     <title>Parser Status</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .status-running {
+            color: #28a745;
+            font-weight: bold;
+        }
+        .status-stopped {
+            color: #dc3545;
+            font-weight: bold;
+        }
+    </style>
 </head>
 <body>
-    <h1>Parser Status: {{ status }}</h1>
-    <p><strong>Instance ID:</strong> {{ instance_id }}</p>
-    <p><strong>Host Name:</strong> {{ host_name }}</p>
-    <p><strong>Total Servers:</strong> {{ total_servers }}</p>
-    {% if status == 'stopped' %}
-    <form action="/start_parser" method="post">
-        <label for="start">Start Position:</label>
-        <input type="number" id="start" name="start" value="0">
-        <label for="limit">Limit:</label>
-        <input type="number" id="limit" name="limit" value="50">
-        <input type="submit" value="Start Parser">
-    </form>
-    {% else %}
-    <form action="/stop_parser" method="post">
-        <input type="submit" value="Stop Parser">
-    </form>
-    {% endif %}
-    <h2>Current Statistics</h2>
-    <pre>{{ stats | tojson(indent=2) }}</pre>
-    <h2>Run History</h2>
-    <table border="1">
-        <tr>
-            <th>Run ID</th>
-            <th>Start Time</th>
-            <th>End Time</th>
-            <th>Parameters</th>
-            <th>Statistics</th>
-        </tr>
-        {% for run in runs %}
-        <tr>
-            <td>{{ run.id }}</td>
-            <td>{{ run.start_time }}</td>
-            <td>{{ run.end_time }}</td>
-            <td>{{ run.parameters }}</td>
-            <td>{{ run.stats }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-    <p><a href="/">Refresh</a></p>
+    <div class="container">
+        <h1 class="mt-5">Parser Status: <span id="status-text" class="status-{{ status }}">{{ status }}</span></h1>
+        <p><strong>Instance ID:</strong> {{ instance_id }}</p>
+        <p><strong>Host Name:</strong> {{ host_name }}</p>
+        <p><strong>Total Servers:</strong> {{ total_servers }}</p>
+
+        <div id="control-panel" class="mb-4">
+            {% if status == 'stopped' %}
+            <form action="/start_parser" method="post" class="card p-3 bg-light">
+                <div class="form-group">
+                    <label for="start">Start Position:</label>
+                    <input type="number" class="form-control" id="start" name="start" value="1">
+                </div>
+                <div class="form-group">
+                    <label for="limit">Limit:</label>
+                    <input type="number" class="form-control" id="limit" name="limit" value="1">
+                </div>
+                <div class="form-group">
+                    <label for="query">Query (optional):</label>
+                    <input type="text" class="form-control" id="query" name="query">
+                </div>
+                <!-- Добавляем остальные параметры из main.py -->
+                <div class="form-group">
+                    <label for="download_threads">Download Threads:</label>
+                    <input type="number" class="form-control" id="download_threads" name="download_threads" value="8">
+                </div>
+                <div class="form-group">
+                    <label for="batch_size">Batch Size:</label>
+                    <input type="number" class="form-control" id="batch_size" name="batch_size" value="16">
+                </div>
+                <div class="form-group">
+                    <label for="report_dir">Report Directory:</label>
+                    <input type="text" class="form-control" id="report_dir" name="report_dir" value="reports">
+                </div>
+                <div class="form-group">
+                    <label for="stats_interval">Stats Interval:</label>
+                    <input type="number" class="form-control" id="stats_interval" name="stats_interval" value="10">
+                </div>
+                <div class="form-group">
+                    <label for="log_level">Log Level:</label>
+                    <select class="form-control" id="log_level" name="log_level">
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO" selected>INFO</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="CRITICAL">CRITICAL</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="log_output">Log Output:</label>
+                    <select class="form-control" id="log_output" name="log_output">
+                        <option value="file" selected>File</option>
+                        <option value="console">Console</option>
+                        <option value="both">Both</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="mode">Mode:</label>
+                    <select class="form-control" id="mode" name="mode">
+                        <option value="t" selected>Threaded</option>
+                        <option value="s">Sequential</option>
+                    </select>
+                </div>
+                <!-- Добавляем чекбоксы для boolean параметров -->
+                <div class="form-group form-check">
+                    <input type="checkbox" class="form-check-input" id="archive" name="archive">
+                    <label class="form-check-label" for="archive">Enable Archiving</label>
+                </div>
+                <!-- Поля для archive_type и archive_config -->
+                <div class="form-group">
+                    <label for="archive_type">Archive Type:</label>
+                    <select class="form-control" id="archive_type" name="archive_type">
+                        <option value="">Select Archive Type</option>
+                        <option value="s3">S3</option>
+                        <option value="azure">Azure</option>
+                        <option value="ftp">FTP</option>
+                        <option value="sftp">SFTP</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="archive_config">Archive Config Path:</label>
+                    <input type="text" class="form-control" id="archive_config" name="archive_config">
+                </div>
+                <div class="form-group">
+                    <label for="archive_threads">Archive Threads:</label>
+                    <input type="number" class="form-control" id="archive_threads" name="archive_threads" value="4">
+                </div>
+                <button type="submit" class="btn btn-primary">Start Parser</button>
+            </form>
+            {% else %}
+            <form action="/stop_parser" method="post">
+                <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="mb-0">Current Statistics</h2>
+            </div>
+            <div class="card-body">
+                <pre id="current-stats" class="mb-0">{{ stats | tojson(indent=2) }}</pre>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2 class="mb-0">Run History</h2>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-bordered table-hover">
+                        <thead class="thead-dark">
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Parameters</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for run in runs %}
+                            <tr>
+                                <td>{{ run.id }}</td>
+                                <td>{{ run.start_time }}</td>
+                                <td>{{ run.end_time or 'Running' }}</td>
+                                <td><pre class="mb-0">{{ run.parameters | tojson(indent=2) }}</pre></td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <a href="{{ url_for('view_run_stats', run_id=run.id) }}"
+                                           class="btn btn-info">View Stats</a>
+                                        <!-- Дополнительные действия можно добавить здесь -->
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Функция для обновления статуса и статистики
+        function updateStatus() {
+            $.getJSON('/parser_status', function(data) {
+                // Обновляем статус
+                const statusText = document.getElementById('status-text');
+                statusText.textContent = data.status;
+                statusText.className = `status-${data.status}`;
+
+                // Обновляем текущую статистику
+                const statsDisplay = document.getElementById('current-stats');
+                if (statsDisplay) {
+                    statsDisplay.textContent = JSON.stringify(data.stats, null, 2);
+                }
+
+                // Обновляем панель управления
+                const controlPanel = document.getElementById('control-panel');
+                if (data.status === 'stopped' && !document.getElementById('start')) {
+                    controlPanel.innerHTML = `<!-- Здесь повторяем форму запуска парсера -->`;
+                    // Повторяем форму запуска с параметрами
+                } else if (data.status === 'running' && !document.querySelector('form[action="/stop_parser"]')) {
+                    controlPanel.innerHTML = `
+                        <form action="/stop_parser" method="post">
+                            <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+                        </form>
+                    `;
+                }
+            });
+        }
+
+        // Обновляем статус каждые 5 секунд
+        setInterval(updateStatus, 5000);
+    </script>
 </body>
 </html>

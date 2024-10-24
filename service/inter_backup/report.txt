@@ -1,0 +1,461 @@
+inter_backup/
+    update_headers.py
+    intermediate_manager.py
+    prepare_gpt.py
+templates/
+    parser_status.html
+    run_stats.html
+
+----
+
+<!-- file: parser_status.html -->
+<!-- directory: templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parser Status</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <style>
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .status-running {
+            color: #28a745;
+            font-weight: bold;
+        }
+        .status-stopped {
+            color: #dc3545;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-5">Parser Status: <span id="status-text" class="status-{{ status }}">{{ status }}</span></h1>
+        <p><strong>Instance ID:</strong> {{ instance_id }}</p>
+        <p><strong>Host Name:</strong> {{ host_name }}</p>
+        <p><strong>Total Servers:</strong> {{ total_servers }}</p>
+
+        <div id="control-panel" class="mb-4">
+            {% if status == 'stopped' %}
+            <form action="/start_parser" method="post" class="card p-3 bg-light">
+                <div class="form-group">
+                    <label for="start">Start Position:</label>
+                    <input type="number" class="form-control" id="start" name="start" value="0">
+                </div>
+                <div class="form-group">
+                    <label for="limit">Limit:</label>
+                    <input type="number" class="form-control" id="limit" name="limit" value="50">
+                </div>
+                <div class="form-group">
+                    <label for="query">Query (optional):</label>
+                    <input type="text" class="form-control" id="query" name="query">
+                </div>
+                <button type="submit" class="btn btn-primary">Start Parser</button>
+            </form>
+            {% else %}
+            <form action="/stop_parser" method="post">
+                <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="mb-0">Current Statistics</h2>
+            </div>
+            <div class="card-body">
+                <pre id="current-stats" class="mb-0">{{ stats | tojson(indent=2) }}</pre>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2 class="mb-0">Run History</h2>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-bordered table-hover">
+                        <thead class="thead-dark">
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Parameters</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for run in runs %}
+                            <tr>
+                                <td>{{ run.id }}</td>
+                                <td>{{ run.start_time }}</td>
+                                <td>{{ run.end_time or 'Running' }}</td>
+                                <td><pre class="mb-0">{{ run.parameters | tojson(indent=2) }}</pre></td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <a href="{{ url_for('view_run_stats', run_id=run.id) }}"
+                                           class="btn btn-info">View Stats</a>
+                                        {% if run.log_archive %}
+                                            <a href="{{ url_for('download_logs', run_id=run.id) }}"
+                                               class="btn btn-success">Download Logs</a>
+                                        {% else %}
+                                            <a href="{{ url_for('archive_logs', run_id=run.id) }}"
+                                               class="btn btn-secondary">Archive Logs</a>
+                                        {% endif %}
+                                        <button onclick="confirmDelete({{ run.id }})"
+                                                class="btn btn-danger">Delete</button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Socket.IO
+        const socket = io({
+            transports: ['websocket'],
+            upgrade: false
+        });
+
+        // Connect event handler
+        socket.on('connect', () => {
+            console.log('WebSocket connected');
+            updateStatusDisplay('connected');
+        });
+
+        // Disconnect event handler
+        socket.on('disconnect', () => {
+            console.log('WebSocket disconnected');
+            updateStatusDisplay('disconnected');
+        });
+
+        socket.on('new_stats', function(data) {
+            lastStatsUpdate = Date.now();
+            // Обновляем статистику
+            const statsDisplay = document.getElementById('current-stats');
+            if (statsDisplay) {
+                statsDisplay.textContent = JSON.stringify(data.stats, null, 2);
+                console.log("Updated stats:", data.stats); // Для отладки
+            }
+        });
+
+        // Status update handler
+        socket.on('parser_status', function(data) {
+            console.log('Received status update:', data);
+
+            // Update status text and class
+            const statusText = document.getElementById('status-text');
+            statusText.textContent = data.status;
+            statusText.className = `status-${data.status}`;
+
+            // Update current stats
+            if (data.stats) {
+                document.getElementById('current-stats').textContent =
+                    JSON.stringify(data.stats, null, 2);
+            }
+
+            // Update control panel if status changed
+            const controlPanel = document.getElementById('control-panel');
+            if (data.status === 'stopped' && !document.getElementById('start')) {
+                controlPanel.innerHTML = `
+                    <form action="/start_parser" method="post" class="card p-3 bg-light">
+                        <div class="form-group">
+                            <label for="start">Start Position:</label>
+                            <input type="number" class="form-control" id="start" name="start" value="0">
+                        </div>
+                        <div class="form-group">
+                            <label for="limit">Limit:</label>
+                            <input type="number" class="form-control" id="limit" name="limit" value="50">
+                        </div>
+                        <div class="form-group">
+                            <label for="query">Query (optional):</label>
+                            <input type="text" class="form-control" id="query" name="query">
+                        </div>
+                        <button type="submit" class="btn btn-primary">Start Parser</button>
+                    </form>
+                `;
+            } else if (data.status === 'running' && !document.querySelector('form[action="/stop_parser"]')) {
+                controlPanel.innerHTML = `
+                    <form action="/stop_parser" method="post">
+                        <button type="submit" class="btn btn-danger btn-lg">Stop Parser</button>
+                    </form>
+                `;
+            }
+        });
+
+        // Function to update status display
+        function updateStatusDisplay(connectionStatus) {
+            const statusText = document.getElementById('status-text');
+            if (connectionStatus === 'disconnected') {
+                statusText.style.opacity = '0.5';
+            } else {
+                statusText.style.opacity = '1';
+            }
+        }
+
+        // Function to confirm deletion
+        function confirmDelete(runId) {
+            if (confirm('Are you sure you want to delete this run?')) {
+                window.location.href = `/delete_run/${runId}`;
+            }
+        }
+
+        // Auto-refresh functionality
+        let lastStatsUpdate = Date.now();
+
+        socket.on('new_stats', function(data) {
+            lastStatsUpdate = Date.now();
+            document.getElementById('current-stats').textContent =
+                JSON.stringify(data.stats, null, 2);
+        });
+
+        // Check for stale connection
+        setInterval(() => {
+            if (Date.now() - lastStatsUpdate > 10000) {  // 10 seconds
+                socket.connect();  // Try to reconnect if we haven't received updates
+            }
+        }, 5000);  // Check every 5 seconds
+    </script>
+</body>
+</html>
+----
+
+<!-- file: run_stats.html -->
+<!-- directory: templates -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Run {{ run.id }} Statistics</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@2.9.4"></script>
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+</head>
+<body>
+<div class="container">
+    <h1 class="mt-5">Statistics for Run {{ run.id }}</h1>
+    <p><strong>Instance ID:</strong> {{ instance_id }}</p>
+    <p><strong>Host Name:</strong> {{ host_name }}</p>
+    <p><strong>Total Servers:</strong> {{ total_servers }}</p>
+    <p><strong>Start Time:</strong> {{ run.start_time }}</p>
+    <p><strong>End Time:</strong> {{ run.end_time }}</p>
+    <p><strong>Parameters:</strong> {{ run.parameters }}</p>
+    <p><strong>Command Line:</strong> {{ run.command_line }}</p>
+
+    <div class="btn-group" role="group">
+        <button class="btn btn-primary" onclick="window.location.href='{{ url_for('export_stats', run_id=run.id) }}'">
+            Export to Excel
+        </button>
+        <button class="btn btn-danger" onclick="confirmDelete()">
+            Delete Run
+        </button>
+        {% if not run.log_archive %}
+            <button class="btn btn-secondary" onclick="window.location.href='{{ url_for('archive_logs', run_id=run.id) }}'">
+                Archive Logs
+            </button>
+        {% else %}
+            <a class="btn btn-success" href="{{ url_for('download_logs', run_id=run.id) }}">Download Logs</a>
+        {% endif %}
+    </div>
+
+    <h2 class="mt-4">Statistics History</h2>
+    <table class="table table-bordered table-striped" id="stats-table">
+        <thead class="thead-dark">
+            <tr>
+                <th>Timestamp</th>
+                <th>Total Files Downloaded</th>
+                <th>+Δ Files Downloaded</th>
+                <th>Total Faces Found</th>
+                <th>+Δ Faces Found</th>
+                <th>Total Embeddings Uploaded</th>
+                <th>+Δ Embeddings Uploaded</th>
+            </tr>
+        </thead>
+        <tbody id="stats-body">
+            {% for entry in stats_entries %}
+            <tr>
+                <td>{{ entry.timestamp }}</td>
+                <td>{{ entry.stats.get('total_files_downloaded', 0) }}</td>
+                <td>{{ entry.incremental_stats.get('total_files_downloaded', 0) }}</td>
+                <td>{{ entry.stats.get('total_faces_found', 0) }}</td>
+                <td>{{ entry.incremental_stats.get('total_faces_found', 0) }}</td>
+                <td>{{ entry.stats.get('total_embeddings_uploaded', 0) }}</td>
+                <td>{{ entry.incremental_stats.get('total_embeddings_uploaded', 0) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Processing Speed Over Time</h2>
+    <div style="height: 400px;">
+        <canvas id="processingSpeedChart"></canvas>
+    </div>
+
+    <script>
+        let chart;
+        const run_id = {{ run.id }};
+
+        // Функция для форматирования временной метки
+        function formatTimestamp(timestamp) {
+            return moment(timestamp).format('HH:mm:ss');
+        }
+
+        // Функция для инициализации графика
+        // Функция для инициализации графика
+        function initChart(initialData) {
+            const ctx = document.getElementById('processingSpeedChart').getContext('2d');
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: initialData.timestamps,
+                    datasets: [
+                        {
+                            label: 'Files Downloaded',
+                            data: initialData.filesDownloaded,
+                            borderColor: 'rgb(75, 192, 192)',
+                            tension: 0.1,
+                            fill: false
+                        },
+                        {
+                            label: 'Faces Found',
+                            data: initialData.facesFound,
+                            borderColor: 'rgb(255, 99, 132)',
+                            tension: 0.1,
+                            fill: false
+                        },
+                        {
+                            label: 'Embeddings Uploaded',
+                            data: initialData.embeddingsUploaded,
+                            borderColor: 'rgb(54, 162, 235)',
+                            tension: 0.1,
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        xAxes: [{  // Измените x на xAxes
+                            type: 'time',
+                            time: {
+                                unit: 'second',
+                                displayFormats: {
+                                    second: 'HH:mm:ss'
+                                }
+                            },
+                            scaleLabel: {  // Измените title на scaleLabel
+                                display: true,
+                                labelString: 'Time'
+                            }
+                        }],
+                        yAxes: [{  // Измените y на yAxes
+                            beginAtZero: true,
+                            scaleLabel: {  // Измените title на scaleLabel
+                                display: true,
+                                labelString: 'Count'
+                            }
+                        }]
+                    },
+                    tooltips: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    legend: {
+                        display: true,
+                        position: 'top'
+                    }
+                }
+            });
+        }
+
+        // Собираем начальные данные из шаблона
+        const initialData = {
+            timestamps: [{% for entry in stats_entries %}'{{ entry.timestamp }}',{% endfor %}],
+            filesDownloaded: [{% for entry in stats_entries %}{{ entry.stats.get('total_files_downloaded', 0) }},{% endfor %}],
+            facesFound: [{% for entry in stats_entries %}{{ entry.stats.get('total_faces_found', 0) }},{% endfor %}],
+            embeddingsUploaded: [{% for entry in stats_entries %}{{ entry.stats.get('total_embeddings_uploaded', 0) }},{% endfor %}]
+        };
+
+        // Инициализируем график после загрузки страницы
+        document.addEventListener('DOMContentLoaded', () => {
+            initChart(initialData);
+            initializeWebSocket();
+        });
+
+        function initializeWebSocket() {
+            const socket = io({
+                transports: ['websocket'],
+                upgrade: false
+            });
+
+            socket.on('connect', () => {
+                console.log('WebSocket connected');
+                socket.emit('join', { 'run_id': run_id });
+            });
+
+            socket.on('disconnect', () => {
+                console.log('WebSocket disconnected');
+            });
+
+
+        function confirmDelete() {
+            if(confirm('Are you sure you want to delete this run?')) {
+                window.location.href = '{{ url_for('delete_run', run_id=run.id) }}';
+            }
+        }
+
+        socket.on('new_stats', function(data) {
+            console.log('Received new stats:', data);
+
+            if (data.run_id !== run_id) {
+                console.log('Ignoring stats for different run');
+                return;
+            }
+
+            // Обновляем таблицу
+            const tableBody = document.getElementById('stats-body');
+            const newRow = document.createElement('tr');
+            newRow.innerHTML = `
+                <td>${data.timestamp}</td>
+                <td>${data.stats.total_files_downloaded || 0}</td>
+                <td>${data.incremental_stats.total_files_downloaded || 0}</td>
+                <td>${data.stats.total_faces_found || 0}</td>
+                <td>${data.incremental_stats.total_faces_found || 0}</td>
+                <td>${data.stats.total_embeddings_uploaded || 0}</td>
+                <td>${data.incremental_stats.total_embeddings_uploaded || 0}</td>
+            `;
+            tableBody.appendChild(newRow);
+
+            // Обновляем график
+            if (chart) {
+                const timestamp = moment(data.timestamp).format('HH:mm:ss');
+                chart.data.labels.push(timestamp);
+                chart.data.datasets[0].data.push(data.stats.total_files_downloaded || 0);
+                chart.data.datasets[1].data.push(data.stats.total_faces_found || 0);
+                chart.data.datasets[2].data.push(data.stats.total_embeddings_uploaded || 0);
+
+                // Ограничиваем количество точек на графике
+                const maxPoints = 50;
+                if (chart.data.labels.length > maxPoints) {
+                    chart.data.labels.shift();
+                    chart.data.datasets.forEach(dataset => dataset.data.shift());
+                }
+
+                chart.update('none');
+            }
+        });
+    </script>
+
+    <p class="mt-4"><a href="/" class="btn btn-secondary">Back to Main Page</a></p>
+</div>
+</body>
+</html>
