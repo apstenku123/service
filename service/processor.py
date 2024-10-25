@@ -235,11 +235,24 @@ def processing_thread(batch_queue, embeddings_queue, archive_queue, device, engi
                             # Get embedding with recognizer
                             embedding_insight = recognizer.get_feat(face_aligned_bgr)
 
+                            # **Add debug statements and flatten the embeddings**
+                            # Debugging: log the shapes of embeddings before flattening
+                            logger.debug(f'FaceNet embedding shape before flattening: {embeddings_facenet[i].shape}')
+                            logger.debug(f'InsightFace embedding shape before flattening: {embedding_insight.shape}')
+
+                            # Ensure embeddings are 1D
+                            embedding_facenet = embeddings_facenet[i].flatten()
+                            embedding_insight = embedding_insight.flatten()
+
+                            # Debugging: log the shapes of embeddings after flattening
+                            logger.debug(f'FaceNet embedding shape after flattening: {embedding_facenet.shape}')
+                            logger.debug(f'InsightFace embedding shape after flattening: {embedding_insight.shape}')
+
                             # Collect embeddings_data
                             embeddings_data.append({
                                 'image_id': image_id,
                                 'filename': filename,
-                                'embedding': embeddings_facenet[i].tolist(),
+                                'embedding': embedding_facenet.tolist(),
                                 'insightface_embedding': embedding_insight.tolist()
                             })
                     else:

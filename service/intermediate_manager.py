@@ -17,12 +17,18 @@ import tarfile
 import io
 import xlsxwriter
 import logging
+from werkzeug.serving import make_server
+import sys
+
+print("Python executable being used:", sys.executable)
+print("Virtual environment prefix:", sys.prefix)
+
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-parser_state = {'status': 'stopped', 'stats': {}}
+parser_state = {'status': 'stopped', 'stats': {}, 'stop_requested': False}
 status_lock = threading.Lock()
 
 app = Flask(__name__, template_folder='templates')
@@ -33,14 +39,11 @@ app.config['FAVICON_FOLDER'] = 'favicon'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['FAVICON_FOLDER'], exist_ok=True)
 
-# Глобальные переменные для процесса парсера и потоков
-parser_process = None
-stdout_thread = None
-stderr_thread = None
-monitor_thread = None
-parser_stats = {}
+# Глобальные переменные для управления процессами парсера
+parser_processes = {}  # Ключ: run_id, Значение: объект процесса
+
 parser_lock = threading.Lock()
-current_run_id = None
+parser_stats = {}
 
 # Конфигурация базы данных
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -84,44 +87,46 @@ INSTANCE_ID = int(os.getenv("INSTANCE_ID", "0"))
 TOTAL_SERVERS = int(os.getenv("TOTAL_SERVERS", "1"))
 HOST_NAME = os.uname()[1]
 
-def monitor_parser_process(run_id):
-    global parser_process, current_run_id
+# Событие для управления завершением работы сервера
+shutdown_event = threading.Event()
+
+def monitor_parser_process(run_id, parser_proc):
     logger.info(f"Monitor thread started for run_id: {run_id}")
     i = 0
     while True:
         time.sleep(1)
         i += 1
-        if parser_process is not None:
-            if parser_process.is_running():
-                if i % 20 == 0:
-                    logger.info(f"Parser process with PID {parser_process.pid} is running.")
-                continue
-            else:
-                logger.info(f"Parser process with PID {parser_process.pid} has terminated.")
+        if parser_proc.is_running():
+            if i % 20 == 0:
+                logger.info(f"Parser process with PID {parser_proc.pid} is running.")
+            continue
         else:
-            logger.info("Parser process is None.")
+            exit_code = parser_proc.wait()
+            logger.info(f"Parser process with PID {parser_proc.pid} has terminated with exit code {exit_code}.")
 
-        with status_lock:
-            parser_state['status'] = 'stopped'
-            parser_state['stats'] = {}
+            # Update parser_state if not running multiple runs
+            with status_lock:
+                if parser_state['status'] == 'running':
+                    parser_state['status'] = 'stopped'
+                    logger.info("Parser status set to 'stopped'.")
 
-        # Обновляем run в базе данных
-        update_run_in_db(run_id, end_time=datetime.now(timezone.utc))
+            # Update run in database
+            update_run_in_db(run_id, end_time=datetime.now(timezone.utc))
 
-        # Перемещаем логи после завершения процесса
-        collect_logs_for_run(run_id)
+            # Collect logs for run
+            collect_logs_for_run(run_id)
 
-        # Очищаем глобальные переменные
-        current_run_id = None
-        parser_process = None
+            # Remove process from the list
+            with parser_lock:
+                parser_processes.pop(run_id, None)
+            # Clear statistics and stats.json
+            if os.path.exists('stats.json'):
+                os.remove('stats.json')
+            with parser_lock:
+                parser_stats.clear()
 
-        # Очищаем статистику и stats.json
-        if os.path.exists('stats.json'):
-            os.remove('stats.json')
-        with parser_lock:
-            parser_stats = {}
-        break
-
+            logger.info("Statistics cleared after parser process termination.")
+            break
 
 def read_output(pipe, log_file):
     with open(log_file, 'w') as f:
@@ -153,7 +158,7 @@ def calculate_incremental_stats(previous_stats, current_stats):
             incremental_stats[key] = current_stats[key]
     return incremental_stats
 
-def collect_stats(run_id):
+def collect_stats(run_id, parser_proc):
     global parser_stats, parser_state
     previous_stats = {}
     last_modified_time = None
@@ -161,7 +166,7 @@ def collect_stats(run_id):
 
     try:
         while True:
-            if parser_process and parser_process.is_running():
+            if parser_proc.is_running():
                 if os.path.exists('stats.json'):
                     current_modified_time = os.path.getmtime('stats.json')
                     if last_modified_time != current_modified_time:
@@ -219,30 +224,16 @@ def favicon():
 
 @app.route('/', methods=['GET'])
 def index():
-    global parser_process, parser_stats
-    status = 'stopped'
-    if parser_process and parser_process.is_running():
-        status = 'running'
-    else:
-        # Если парсер не запущен, очищаем stats.json
-        if os.path.exists('stats.json'):
-            os.remove('stats.json')
-            with parser_lock:
-                parser_stats = {}
+    global parser_stats
+    with status_lock:
+        status = parser_state.get('status', 'stopped')
     session = Session()
     runs = session.query(ParserRun).filter_by(instance_id=INSTANCE_ID).order_by(ParserRun.start_time.desc()).all()
     session.close()
     return render_template('parser_status.html', status=status, stats=parser_stats, runs=runs, instance_id=INSTANCE_ID, host_name=HOST_NAME, total_servers=TOTAL_SERVERS)
 
-
 @app.route('/start_parser', methods=['POST'])
 def start_parser():
-    global parser_process, parser_stats
-    global current_run_id
-    global stdout_thread
-    global stderr_thread
-    global monitor_thread
-
     data = request.form or request.json or {}
 
     # Получаем все параметры из запроса
@@ -256,32 +247,69 @@ def start_parser():
         'log_level': data.get('log_level', 'INFO'),
         'log_output': data.get('log_output', 'file'),
         'loggers': data.get('loggers', ''),
-        'archive': data.get('archive', False),
+        'archive': 'archive' in data,
         'archive_type': data.get('archive_type', ''),
         'archive_config': data.get('archive_config', ''),
         'archive_threads': data.get('archive_threads', '4'),
-        'service': data.get('service', False),
+        'service': 'service' in data,
         'port': data.get('port', '8070'),
         'query': data.get('query', ''),
-        'mode': data.get('mode', 't')
+        'mode': data.get('mode', 't'),
+        'machine_id': data.get('machine_id', str(INSTANCE_ID)),
+        'total_machines': data.get('total_machines', str(TOTAL_SERVERS)),
+        'multiple_runs': 'multiple_runs' in data,
+        'total_limit': data.get('total_limit', '100000'),
+        'per_run_limit': data.get('per_run_limit', '50'),
     }
 
     # Проверка, запущен ли процесс парсера
-    if parser_process and parser_process.is_running():
+    with status_lock:
+        if parser_state['status'] == 'running' or parser_state['status'] == 'running_multiple':
+            if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
+                return jsonify({'status': 'Parser is already running'}), 400
+            # Если запрос через HTML, перерисовываем страницу
+            return redirect(url_for('index'))
+
+    if parser_args.get('multiple_runs'):
+        # Запускаем многократный запуск в отдельном потоке
+        multiple_runs_thread = threading.Thread(target=run_multiple_parsers, args=(parser_args,))
+        multiple_runs_thread.start()  # Не устанавливаем daemon=True
+        with status_lock:
+            parser_state['status'] = 'running_multiple'
         if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
-            return jsonify({'status': 'Parser is already running'}), 400
-        # Если запрос через HTML, перерисовываем страницу
-        return render_template('parser_status.html', status='running', stats=parser_stats)
+            return jsonify({'status': 'Multiple runs started'}), 200
+        else:
+            return redirect(url_for('index'))
+    else:
+        # Запуск одиночного парсера
+        run_id = start_single_parser(parser_args)
+        with status_lock:
+            parser_state['status'] = 'running'
+        if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
+            return jsonify({'status': 'Parser started', 'run_id': run_id}), 200
+        else:
+            return redirect(url_for('index'))
+
+def start_single_parser(parser_args):
+    # Установка переменных окружения
+    os.environ['MACHINE_ID'] = parser_args['machine_id']
+    os.environ['TOTAL_MACHINES'] = parser_args['total_machines']
 
     # Формируем команду для запуска парсера
-    command = ['python', 'main.py']
+    command = [sys.executable, 'main.py']
+    # command = ['python', 'main.py']
     for key, value in parser_args.items():
+        if key in ['multiple_runs', 'total_limit', 'per_run_limit']:
+            continue  # Эти параметры не передаются в командную строку
         if isinstance(value, bool):
             if value:
                 command.append(f'--{key.replace("_", "-")}')
         elif value:
             command.append(f'--{key.replace("_", "-")}')
             command.append(str(value))
+
+    if os.path.exists('stats.json'):
+       os.remove('stats.json')
 
     # Сохраняем параметры для записи в базу данных
     parameters = parser_args.copy()
@@ -295,16 +323,10 @@ def start_parser():
     )
     session.add(new_run)
     session.commit()
-    current_run_id = new_run.id
+    run_id = new_run.id
     session.close()
 
-    os.environ['RUN_ID'] = str(current_run_id)
-
-    # Если файл stats.json существует и парсер не запущен, удаляем его
-    if os.path.exists('stats.json'):
-        os.remove('stats.json')
-        with parser_lock:
-            parser_stats = {}
+    os.environ['RUN_ID'] = str(run_id)
 
     # Запускаем процесс парсинга
     parser_subprocess = subprocess.Popen(
@@ -317,79 +339,125 @@ def start_parser():
 
     # Сохраняем PID в базе данных
     session = Session()
-    run = session.query(ParserRun).filter_by(id=current_run_id).first()
+    run = session.query(ParserRun).filter_by(id=run_id).first()
     if run:
         run.pid = parser_subprocess.pid
         session.commit()
     session.close()
 
-    parser_process = psutil.Process(parser_subprocess.pid)
+    parser_proc = psutil.Process(parser_subprocess.pid)
     print("Started parser process with pid", parser_subprocess.pid)
 
+    # Сохраняем процесс в глобальном словаре
+    with parser_lock:
+        parser_processes[run_id] = parser_proc
+
     # Логи процесса
-    stdout_log_file = f'logs/run_{current_run_id}_stdout.log'
-    stderr_log_file = f'logs/run_{current_run_id}_stderr.log'
+    stdout_log_file = f'logs/run_{run_id}_stdout.log'
+    stderr_log_file = f'logs/run_{run_id}_stderr.log'
 
-    stdout_thread = threading.Thread(target=read_output, args=(parser_subprocess.stdout, stdout_log_file))
-    stderr_thread = threading.Thread(target=read_output, args=(parser_subprocess.stderr, stderr_log_file))
-
-    stdout_thread.start()
-    stderr_thread.start()
+    threading.Thread(target=read_output, args=(parser_subprocess.stdout, stdout_log_file)).start()
+    threading.Thread(target=read_output, args=(parser_subprocess.stderr, stderr_log_file)).start()
 
     # Статистика парсинга в отдельном потоке
-    stats_thread = threading.Thread(target=collect_stats, args=(current_run_id,))
-    stats_thread.daemon = True
-    stats_thread.start()
+    threading.Thread(target=collect_stats, args=(run_id, parser_proc)).start()
 
     # Мониторинг процесса парсера
-    monitor_thread = threading.Thread(target=monitor_parser_process, args=(current_run_id,))
-    monitor_thread.daemon = True
-    monitor_thread.start()
+    threading.Thread(target=monitor_parser_process, args=(run_id, parser_proc)).start()
+
+    return run_id
+
+def run_multiple_parsers(parser_args):
+    logger.info("Starting multiple parser runs.")
+    total_limit = int(parser_args['total_limit'])
+    per_run_limit = int(parser_args['per_run_limit'])
+    start_position = int(parser_args.get('start', '1'))
+
+    num_runs = (total_limit + per_run_limit - 1) // per_run_limit
+    logger.info(f"Total runs to execute: {num_runs}")
+
+    for i in range(num_runs):
+        logger.info(f"Starting run {i + 1} of {num_runs}")
+        with status_lock:
+            if parser_state.get('stop_requested') or shutdown_event.is_set():
+                logger.info("Stop requested. Exiting multiple runs.")
+                break
+
+        current_start = start_position + i * per_run_limit
+        current_limit = min(per_run_limit, total_limit - i * per_run_limit)
+        logger.info(f"Run {i + 1}: Start position {current_start}, Limit {current_limit}")
+
+        parser_args_run = parser_args.copy()
+        parser_args_run['start'] = str(current_start)
+        parser_args_run['limit'] = str(current_limit)
+        parser_args_run['multiple_runs'] = False  # Avoid recursion
+
+        run_id = start_single_parser(parser_args_run)
+
+        # Wait for parser to finish
+        while True:
+            time.sleep(1)
+            with parser_lock:
+                parser_proc = parser_processes.get(run_id)
+            if not parser_proc or not parser_proc.is_running():
+                logger.info(f"Run {i + 1} completed.")
+                break
+            with status_lock:
+                if parser_state.get('stop_requested') or shutdown_event.is_set():
+                    # Stop current process
+                    logger.info("Stop requested during run. Terminating parser process.")
+                    try:
+                        parser_proc.terminate()
+                        parser_proc.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        parser_proc.kill()
+                    break
 
     with status_lock:
-        parser_state['status'] = 'running'
+        parser_state['status'] = 'stopped'
+        parser_state['stop_requested'] = False
+    logger.info("All runs completed. Parser status set to 'stopped'.")
 
-    # Проверка типа запроса: если это JSON-запрос, возвращаем JSON
-    if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
-        return jsonify({'status': 'Parser started', 'run_id': current_run_id}), 200
+def stop_parser():
+    global parser_processes
 
-    # Иначе возвращаем HTML
-    return redirect(url_for('index'))
+    with status_lock:
+        parser_state['stop_requested'] = True
 
+    # Останавливаем все запущенные процессы
+    with parser_lock:
+        for run_id, parser_proc in list(parser_processes.items()):
+            if parser_proc.is_running():
+                try:
+                    parser_proc.terminate()
+                    parser_proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    parser_proc.kill()
+                finally:
+                    # Удаляем процесс из списка после его остановки
+                    parser_processes.pop(run_id, None)
+                    # Обновляем run в базе данных
+                    update_run_in_db(run_id, end_time=datetime.now(timezone.utc))
+                    # Собираем логи
+                    collect_logs_for_run(run_id)
+
+    with status_lock:
+        parser_state['status'] = 'stopped'
+        parser_state['stats'] = {}
+        parser_state['stop_requested'] = False  # Сбрасываем флаг после остановки
+
+    with parser_lock:
+        parser_stats.clear()
+
+    logger.info('Parser stopped.')
 
 @app.route('/stop_parser', methods=['POST'])
-def stop_parser():
-    global parser_process, current_run_id, stdout_thread, stderr_thread
-
-    if parser_process and parser_process.is_running():
-        try:
-            parser_process.terminate()
-            parser_process.wait(timeout=5)
-        except psutil.TimeoutExpired:
-            parser_process.kill()
-
-        parser_process = None
-
-        if stdout_thread and stdout_thread.is_alive():
-            stdout_thread.join()
-        if stderr_thread and stderr_thread.is_alive():
-            stderr_thread.join()
-
-        update_run_in_db(current_run_id, end_time=datetime.utcnow())
-        current_run_id = None
-
-        # Очищаем статистику и stats.json
-        if os.path.exists('stats.json'):
-            os.remove('stats.json')
-        with status_lock:
-            parser_state['status'] = 'stopped'
-            parser_state['stats'] = {}
-        with parser_lock:
-            parser_stats = {}
-
+def stop_parser_route():
+    stop_parser()
+    if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
         return jsonify({'status': 'Parser stopped'}), 200
     else:
-        return jsonify({'status': 'Parser is not running'}), 400
+        return redirect(url_for('index'))
 
 @app.route('/start_parser_api', methods=['POST'])
 def start_parser_api():
@@ -400,6 +468,7 @@ def archive_logs(run_id):
     collect_logs_for_run(run_id)
     return redirect(url_for('view_run_stats', run_id=run_id))
 
+
 def collect_logs_for_run(run_id):
     session = Session()
     run = session.query(ParserRun).filter_by(id=run_id).first()
@@ -408,31 +477,35 @@ def collect_logs_for_run(run_id):
         return
 
     log_dir = 'logs'
-    run_log_dir = f'logs/run_{run_id}'
+    run_log_dir = os.path.join(log_dir, f'run_{run_id}')
     os.makedirs(run_log_dir, exist_ok=True)
+
     for root, dirs, files in os.walk(log_dir):
+        # Prevent descending into run_log_dir and other run directories
+        dirs[:] = [d for d in dirs if not d.startswith('run_') or d == f'run_{run_id}']
+
         for file in files:
+            # Only move files that match the current run_id or INSTANCE_ID
             if f'_{run_id}' in file or f'_{INSTANCE_ID}' in file:
                 file_path = os.path.join(root, file)
                 if os.path.isfile(file_path):
-                    relative_path = os.path.relpath(os.path.join(root, file), log_dir)
+                    # Calculate relative path from log_dir
+                    relative_path = os.path.relpath(file_path, log_dir)
                     dest_path = os.path.join(run_log_dir, relative_path)
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     shutil.move(file_path, dest_path)
     tar_file = os.path.join('logs', f'run_{run_id}.tar.gz')
     with tarfile.open(tar_file, 'w:gz') as tar:
         tar.add(run_log_dir, arcname=os.path.basename(run_log_dir))
+    # Optionally remove the run_log_dir
     # shutil.rmtree(run_log_dir)
     if run:
-        run.log_archive = tar_file  # Сохраняем путь к архиву
+        run.log_archive = tar_file  # Save the path to the archive
         session.commit()
     session.close()
 
-
-
 @app.route('/parser_status', methods=['GET'])
 def get_parser_status():
-    global parser_process
     with status_lock:
         status = parser_state.get('status', 'stopped')
         stats = parser_state.get('stats', {})
@@ -525,8 +598,6 @@ def download_logs(run_id):
     # Возвращаем сжатый файл tar.gz
     return send_file(run.log_archive, as_attachment=True)
 
-
-
 @app.route('/view_log/<int:run_id>/<path:log_file>', methods=['GET'])
 def view_log(run_id, log_file):
     session = Session()
@@ -534,35 +605,51 @@ def view_log(run_id, log_file):
     session.close()
 
     if run.end_time:
-        # Логи завершённого процесса
+        # Logs of a finished process
         log_path = os.path.join('logs', f'run_{run_id}', log_file)
     else:
-        # Текущие логи
+        # Current logs
         log_path = os.path.join('logs', log_file)
 
     if not os.path.exists(log_path):
         return "Log file not found", 404
+
     return render_template('view_log.html', log_file=log_file, run_id=run_id)
 
-@app.route('/get_log_content/<int:run_id>/<path:log_file>', methods=['GET'])
-def get_log_content(run_id, log_file):
+
+@app.route('/get_log_content/<int:run_id>/<path:log_path>')
+def get_log_content(run_id, log_path):
     session = Session()
-    run = session.query(ParserRun).filter_by(id=run_id).first()
-    session.close()
+    try:
+        run = session.query(ParserRun).filter_by(id=run_id).first()
+        if not run:
+            return jsonify({'error': 'Run not found'}), 404
 
-    if run.end_time:
-        # Логи завершённого процесса
-        log_path = os.path.join('logs', f'run_{run_id}', log_file)
-    else:
-        # Текущие логи
-        log_path = os.path.join('logs', log_file)
+        if run.end_time:
+            # Logs of a finished process
+            log_file_path = os.path.join('logs', f'run_{run_id}', log_path)
+            tail_size = None  # Return full log if the run has ended
+        else:
+            # Current logs
+            log_file_path = os.path.join('logs', log_path)
+            tail_size = 100 * 1024  # 100 KB
 
-    if not os.path.exists(log_path):
-        return jsonify({"error": "Log file not found"}), 404
+        if not os.path.exists(log_file_path):
+            return jsonify({'error': 'Log file not found'}), 404
 
-    with open(log_path, 'r') as file:
-        content = file.read()[-10000:]
-    return jsonify({"content": content})
+        if tail_size:
+            with open(log_file_path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                f.seek(max(file_size - tail_size, 0), os.SEEK_SET)
+                content = f.read().decode('utf-8', errors='replace')
+        else:
+            with open(log_file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+
+        return jsonify({'content': content})
+    finally:
+        session.close()
 
 
 
@@ -574,8 +661,8 @@ def list_logs(run_id):
 
     logs = []
     if run.end_time:
-        # Логи завершённого процесса находятся в logs/run_<run_id>
-        log_dir = f'logs/run_{run_id}'
+        # Logs of a finished process are in logs/run_<run_id>
+        log_dir = os.path.join('logs', f'run_{run_id}')
         if not os.path.exists(log_dir):
             return "Log directory not found", 404
         for root, dirs, files in os.walk(log_dir):
@@ -583,9 +670,11 @@ def list_logs(run_id):
                 file_path = os.path.relpath(os.path.join(root, file), log_dir)
                 logs.append(file_path)
     else:
-        # Логи запущенного процесса находятся в исходных директориях
+        # Logs of a running process are in the root logs directory
         log_dir = 'logs'
+        # Exclude run_<run_id> directory to avoid confusion
         for root, dirs, files in os.walk(log_dir):
+            dirs[:] = [d for d in dirs if d != f'run_{run_id}']
             for file in files:
                 if f'_{run_id}' in file or f'_{INSTANCE_ID}' in file:
                     file_path = os.path.relpath(os.path.join(root, file), log_dir)
@@ -597,6 +686,64 @@ def list_logs(run_id):
     return render_template('list_logs.html', logs=logs, run_id=run_id)
 
 
+@app.route('/get_run_history', methods=['GET'])
+def get_run_history():
+    session = Session()
+    runs = session.query(ParserRun).filter_by(instance_id=INSTANCE_ID).order_by(ParserRun.start_time.desc()).all()
+    session.close()
+    run_list = []
+    for run in runs:
+        run_list.append({
+            'id': run.id,
+            'start_time': run.start_time.isoformat(),
+            'end_time': run.end_time.isoformat() if run.end_time else 'Running',
+            'parameters': run.parameters,
+            'log_archive': bool(run.log_archive),
+        })
+    return jsonify(run_list)
+
+# Класс для управления сервером
+class ServerThread(threading.Thread):
+    def __init__(self, app):
+        threading.Thread.__init__(self)
+        self.server = make_server('0.0.0.0', 8080, app, threaded=True)
+        self.ctx = app.app_context()
+        self.ctx.push()
+
+    def run(self):
+        logger.info("Starting server...")
+        self.server.serve_forever()
+
+    def shutdown(self):
+        logger.info("Shutting down server...")
+        self.server.shutdown()
+        self.ctx.pop()
+
+# Функция для корректного завершения при получении сигналов
+def graceful_shutdown(signum, frame):
+    global server
+    logger.info(f"Received shutdown signal: {signum}")
+    # Устанавливаем флаг завершения
+    shutdown_event.set()
+    # Останавливаем парсеры
+    stop_parser()
+    logger.info("Server shutdown initiated.")
+    # Останавливаем сервер
+    if server:
+        server.shutdown()
+
+# Регистрация обработчиков сигналов
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    server = ServerThread(app)
+    server.start()
+
+    try:
+        while not shutdown_event.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        graceful_shutdown(signal.SIGINT, None)
+
+    logger.info("Server has been stopped.")

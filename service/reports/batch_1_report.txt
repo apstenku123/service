@@ -1,0 +1,5 @@
+Batch ID: 1
+Total images processed: 90
+Total faces detected: 1020
+Images with faces: 85
+Images without faces: 5

@@ -57,6 +57,10 @@ def main():
                         help='Number of archiver threads (default 4)')
     parser.add_argument('--service', action='store_true', help='Run as a web service')
     parser.add_argument('--port', type=int, default=8070, help='Port for the web service (default 8070)')
+    parser.add_argument('-mi', '--machine-id', type=int, default=int(os.environ.get('MACHINE_ID', 0)),
+                        help='ID of the machine (default from env or 0)')
+    parser.add_argument('-tm', '--total-machines', type=int, default=int(os.environ.get('TOTAL_MACHINES', 1)),
+                        help='Total number of machines (default from env or 1)')
 
     # Добавляем новый аргумент командной строки для поисковой строки
     parser.add_argument('-q', '--query', type=str, help='Search query string')
@@ -67,9 +71,11 @@ def main():
 
     args = parser.parse_args()
 
+    # Set MACHINE_ID and TOTAL_MACHINES from command-line arguments or environment variables
+    config.MACHINE_ID = args.machine_id
+    TOTAL_MACHINES = args.total_machines
+
     # Read environment variables
-    config.MACHINE_ID = int(os.environ.get('MACHINE_ID', '0'))
-    TOTAL_MACHINES = int(os.environ.get('TOTAL_MACHINES', '1'))
     DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', 'downloads')
     MAX_BATCHES_ON_DISK = int(os.environ.get('MAX_BATCHES_ON_DISK', '5'))
     config.current_batches_on_disk = 0  # Инициализируем переменную
@@ -346,13 +352,13 @@ def generate_page_infos(args, total_pages_to_process):
         search_query = args.query
         total_pages = total_pages_to_process
         for page_num in range(1, total_pages + 1):
-            if (page_num % int(os.environ.get('TOTAL_MACHINES', '1'))) != config.MACHINE_ID:
+            if (page_num % args.total_machines) != args.machine_id:
                 continue
             page_info = {'page_number': page_num, 'query': search_query}
             page_infos.append(page_info)
     else:
         for page_num in range(args.start, args.start + args.limit):
-            if (page_num % int(os.environ.get('TOTAL_MACHINES', '1'))) != config.MACHINE_ID:
+            if (page_num % args.total_machines) != args.machine_id:
                 continue
             page_info = {'page_number': page_num, 'query': None}
             page_infos.append(page_info)
